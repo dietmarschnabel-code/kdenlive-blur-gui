@@ -21,6 +21,7 @@ for s in 512 256 128 64 48; do
     install -D -m 644 "assets/icons/$s.png" "$STAGE/usr/share/icons/hicolor/${s}x${s}/apps/autoblur-gui.png"
 done
 gzip -9n -c README.md > "$STAGE/usr/share/doc/$PKG/README.md.gz"
+install -m 644 LICENSE "$STAGE/usr/share/doc/$PKG/LICENSE"
 cat > "$STAGE/usr/share/doc/$PKG/copyright" <<COPYRIGHT
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: $PKG
@@ -29,11 +30,8 @@ Source: $HOMEPAGE
 Files: *
 Copyright: 2026 Kdenlive Auto-Blur Tool contributors
 License: AGPL-3+
- This program is free software: you can redistribute it and/or modify it under the
- terms of the GNU Affero General Public License as published by the Free Software
- Foundation, either version 3 of the License, or (at your option) any later version.
- .
- On Debian systems the full text is in /usr/share/common-licenses/AGPL-3.
+ The full text of the GNU Affero General Public License is in
+ /usr/share/doc/$PKG/LICENSE.
 COPYRIGHT
 
 INSTALLED_KB="$(du -sk "$STAGE/usr" | cut -f1)"
