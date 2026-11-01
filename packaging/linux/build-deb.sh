@@ -18,7 +18,7 @@ install -m 644 kdenlive_blur_gui.py                       "$STAGE/usr/share/$PKG
 install -m 644 kdenlive-blur-gui.png                      "$STAGE/usr/share/$PKG/kdenlive-blur-gui.png"
 install -m 644 packaging/linux/kdenlive-blur-gui.desktop  "$STAGE/usr/share/applications/$PKG.desktop"
 for s in 512 256 128 64 48; do
-    install -D -m 644 "assets/icons/$s.png" "$STAGE/usr/share/icons/hicolor/${s}x${s}/apps/$PKG.png"
+    install -D -m 644 "assets/icons/$s.png" "$STAGE/usr/share/icons/hicolor/${s}x${s}/apps/autoblur-gui.png"
 done
 gzip -9n -c README.md > "$STAGE/usr/share/doc/$PKG/README.md.gz"
 cat > "$STAGE/usr/share/doc/$PKG/copyright" <<COPYRIGHT
@@ -28,12 +28,12 @@ Source: $HOMEPAGE
 
 Files: *
 Copyright: 2026 Kdenlive Auto-Blur Tool contributors
-License: GPL-3.0+
+License: AGPL-3+
  This program is free software: you can redistribute it and/or modify it under the
- terms of the GNU General Public License as published by the Free Software
+ terms of the GNU Affero General Public License as published by the Free Software
  Foundation, either version 3 of the License, or (at your option) any later version.
  .
- On Debian systems the full text is in /usr/share/common-licenses/GPL-3.
+ On Debian systems the full text is in /usr/share/common-licenses/AGPL-3.
 COPYRIGHT
 
 INSTALLED_KB="$(du -sk "$STAGE/usr" | cut -f1)"

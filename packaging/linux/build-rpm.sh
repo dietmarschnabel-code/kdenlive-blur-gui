@@ -6,7 +6,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' kdenlive_blur_gui.py)"
-[ -f LICENSE ] || { echo "LICENSE is missing - add the GPL-3.0 text first (see README)."; exit 1; }
+[ -f LICENSE ] || { echo "LICENSE is missing - add the AGPL-3.0 text first (see README)."; exit 1; }
 mkdir -p "$HOME/rpmbuild/SOURCES"
 TARBALL="$HOME/rpmbuild/SOURCES/kdenlive-blur-gui-$VERSION.tar.gz"
 tar --exclude=.git --exclude=build --exclude=dist \
