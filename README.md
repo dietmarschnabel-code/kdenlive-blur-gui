@@ -78,7 +78,7 @@ sudo dnf install python3 python3-tkinter ffmpeg-free git
 
 #### 2. Get the tool
 ```bash
-git clone https://github.com/YOUR-USER/kdenlive-blur-gui.git
+git clone https://github.com/dietmarschnabel-code/kdenlive-blur-gui.git
 cd kdenlive-blur-gui
 ```
 (or download the ZIP from GitHub and unpack it). The whole program is the single file `kdenlive_blur_gui.py`.
@@ -205,7 +205,7 @@ Run these from a clone of the repository. Put the GPL-3.0 text into a file named
 
 ```bash
 # Debian / Ubuntu  (needs dpkg-deb)
-MAINTAINER="Your Name <you@example.com>" HOMEPAGE="https://github.com/YOUR-USER/kdenlive-blur-gui" ./packaging/linux/build-deb.sh
+MAINTAINER="Dietmar Schnabel <dietmar.schnabel<at>gmail.com>" HOMEPAGE="https://github.com/dietmarschnabel-code/kdenlive-blur-gui" ./packaging/linux/build-deb.sh
 #   -> dist/kdenlive-blur-gui_<version>_all.deb
 
 # Fedora  (sudo dnf install rpm-build desktop-file-utils)
