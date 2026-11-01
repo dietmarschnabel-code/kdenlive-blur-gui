@@ -208,12 +208,9 @@ Windows *Apps & features*), then delete the two folders above if you want to get
 
 ## Building the packages
 
-Run these from a clone of the repository. Put the GPL-3.0 text into a file named `LICENSE` first:
-`curl -L -o LICENSE https://www.gnu.org/licenses/gpl-3.0.txt`
-
 ```bash
 # Debian / Ubuntu  (needs dpkg-deb)
-MAINTAINER="Your Name <you@example.com>" HOMEPAGE="https://github.com/YOUR-USER/kdenlive-blur-gui" ./packaging/linux/build-deb.sh
+MAINTAINER="Dietmar Schnabel <dietmar.schnabel@gmail.com>" HOMEPAGE="https://github.com/dietmarschnabel-code/kdenlive-blur-gui" ./packaging/linux/build-deb.sh
 #   -> dist/kdenlive-blur-gui_<version>_all.deb
 
 # Fedora  (sudo dnf install rpm-build desktop-file-utils)
@@ -229,8 +226,8 @@ The version number is `__version__` in `kdenlive_blur_gui.py`; keep the `Version
 
 ## License
 
-The Kdenlive Auto-Blur Tool is free software, licensed under the **GNU General Public License, version 3 or
-later** (see `LICENSE`).
+The Kdenlive Auto-Blur Tool is free software, licensed under the **GNU Affero General Public License,
+version 3 or later** (see `LICENSE`).
 
 It uses these components, which are installed separately and keep their own licenses:
 [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) (AGPL-3.0, also for the model files it downloads),
