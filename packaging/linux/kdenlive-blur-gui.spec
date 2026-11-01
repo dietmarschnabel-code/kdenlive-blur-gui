@@ -54,5 +54,5 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/kdenlive-blur-gui.des
 %{_datadir}/icons/hicolor/*/apps/kdenlive-blur-gui.png
 
 %changelog
-* Sun Nov 01 2026 Your Name <you@example.com> - 1.0.0-1
+* Sun Nov 01 2026 Dietmar Schnabel <dietmar.schnabel<at>gmail.com> - 1.0.0-1
 - Initial package

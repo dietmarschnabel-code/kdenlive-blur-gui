@@ -1,11 +1,11 @@
 #!/bin/sh
 # Builds dist/kdenlive-blur-gui_<version>_all.deb  (run from anywhere; needs dpkg-deb)
-#   MAINTAINER="Your Name <you@example.com>" ./packaging/linux/build-deb.sh
+#   MAINTAINER="Dietmar Schnabel <dietmar.schnabel<at>gmail.com>" ./packaging/linux/build-deb.sh
 set -eu
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' kdenlive_blur_gui.py)"
-MAINTAINER="${MAINTAINER:-Your Name <you@example.com>}"
+MAINTAINER="${MAINTAINER:-Dietmar Schnabel <dietmar.schnabel<at>gmail.com>}"
 HOMEPAGE="${HOMEPAGE:-https://github.com/YOUR-USER/kdenlive-blur-gui}"
 PKG="kdenlive-blur-gui"
 STAGE="build/deb/${PKG}_${VERSION}_all"
