@@ -210,7 +210,7 @@ Windows *Apps & features*), then delete the two folders above if you want to get
 
 ```bash
 # Debian / Ubuntu  (needs dpkg-deb)
-MAINTAINER="Dietmar Schnabel <dietmar.schnabel@gmail.com>" HOMEPAGE="https://github.com/dietmarschnabel-code/kdenlive-blur-gui" ./packaging/linux/build-deb.sh
+MAINTAINER="Dietmar Schnabel <dietmar.schnabel<at>gmail.com>" HOMEPAGE="https://github.com/dietmarschnabel-code/kdenlive-blur-gui" ./packaging/linux/build-deb.sh
 #   -> dist/kdenlive-blur-gui_<version>_all.deb
 
 # Fedora  (sudo dnf install rpm-build desktop-file-utils)
