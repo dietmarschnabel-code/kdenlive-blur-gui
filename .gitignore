@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.deb
+*.rpm
+*.exe
+# local test projects and models
+*.kdenlive
+*.pt
+*.mkv

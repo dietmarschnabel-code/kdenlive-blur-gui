@@ -1,0 +1,4 @@
+#!/bin/sh
+# Starts the Kdenlive Auto-Blur Tool. Missing Python components are offered for
+# download (into a private folder in your home directory) on the first start.
+exec python3 /usr/share/kdenlive-blur-gui/kdenlive_blur_gui.py "$@"

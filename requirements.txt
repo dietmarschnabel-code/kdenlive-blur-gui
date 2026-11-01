@@ -1,0 +1,8 @@
+# Only needed for a MANUAL installation (see README). The packages and the first-start
+# installer do this automatically. PyTorch is pulled in by ultralytics; for a smaller
+# CPU/Intel-GPU-only install first run:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+ultralytics
+opencv-python
+pillow
+openvino

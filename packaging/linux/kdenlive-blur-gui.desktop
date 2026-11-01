@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Kdenlive Auto-Blur Tool
+GenericName=Video Anonymizer
+Comment=Detect, track and blur people and vehicles in Kdenlive projects
+Exec=kdenlive-blur-gui
+Icon=kdenlive-blur-gui
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+Keywords=kdenlive;blur;anonymize;privacy;faces;license plates;yolo;
+StartupNotify=true
+StartupWMClass=Kdenlive-blur-gui
