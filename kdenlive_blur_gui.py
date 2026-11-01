@@ -44,6 +44,8 @@ def _data_dir():
 
 
 VENV_DIR = os.path.join(_data_dir(), "venv")
+_OK_MARKER = os.path.join(VENV_DIR, ".components_ok")     # written when the private environment is known to be complete
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0         # subprocess flag: never pop up a console window on Windows
 MODELS_DIR = os.path.join(_data_dir(), "models")      # YOLO weights (and their OpenVINO export) live here
 _LOG_PATH = None
 
@@ -155,9 +157,9 @@ class _InstallError(Exception):
 
 def _run_logged(cmd, log):
     log("$ " + " ".join(cmd))
-    kw = {"creationflags": 0x08000000} if os.name == "nt" else {}      # no extra console window on Windows
     env = dict(os.environ, PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONUNBUFFERED="1")
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", env=env, **kw)
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         errors="replace", env=env, creationflags=_NO_WINDOW)
     for line in p.stdout:
         log(line.rstrip())
     return p.wait()
@@ -167,6 +169,8 @@ def install_dependencies(variant, log):
     """variant 'cpu': CPU build of PyTorch (small, also used for Intel GPUs through OpenVINO).
     variant 'default': whatever PyPI offers (on Linux a large CUDA build for NVIDIA cards)."""
     os.makedirs(_data_dir(), exist_ok=True)
+    if os.path.exists(_OK_MARKER):
+        os.remove(_OK_MARKER)
     if not os.path.exists(_venv_python()):
         log("Creating a private Python environment in " + VENV_DIR)
         if _run_logged([sys.executable, "-m", "venv", VENV_DIR], log) != 0:
@@ -180,6 +184,8 @@ def install_dependencies(variant, log):
         if _run_logged(cmd, log) != 0:
             raise _InstallError("A download or installation step failed (see the log above).\n"
                                 "Check your internet connection, then start the tool again to retry.")
+    with open(_OK_MARKER, "w", encoding="utf-8") as f:
+        f.write(__version__)
     log("All components installed.")
 
 
@@ -313,10 +319,17 @@ def _bootstrap_after_import_error(err):
         if "libGL" in reason or "libglib" in reason:
             hint = "\n\nA system library is missing. On Debian/Ubuntu:  sudo apt install libgl1 libglib2.0-0"
         _fatal(APP_NAME, "A component of the private Python environment cannot be loaded:\n\n%s%s\n\n"
-                         "To repair it run:\n  python3 kdenlive_blur_gui.py --install-deps" % (reason, hint))
+                         "To repair it run in a terminal:\n  %s kdenlive_blur_gui.py --install-deps" % (reason, hint, "py" if os.name == "nt" else "python3"))
     if os.path.exists(_venv_python()):
-        quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if os.path.exists(_OK_MARKER):
+            _relaunch_in_venv()                    # known to be complete: no slow check, no flashing console window
+        quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "creationflags": _NO_WINDOW}
         if subprocess.call([_venv_python(), "-c", "import cv2, PIL.ImageTk, ultralytics"], **quiet) == 0:
+            try:
+                with open(_OK_MARKER, "w", encoding="utf-8") as f:     # remember it for the next start
+                    f.write(__version__)
+            except OSError:
+                pass
             _relaunch_in_venv()
     ok = _run_installer(reason)
     if ok:
@@ -351,6 +364,7 @@ except ImportError as _err:
 import xml.etree.ElementTree as ET
 import re
 
+import bisect
 import copy
 import math
 import re
@@ -381,7 +395,7 @@ class ProjectError(Exception):
 
 class Options:
     def __init__(self, blur_strength=20, blur_type="Pixalate", kdenlive_id="opencv.tracker",
-                 existing="keep", merge_gap=15, split_audio=True):
+                 existing="keep", merge_gap=15, split_audio=True, thin_pct=4.0):
         self.blur_strength = int(blur_strength)
         self.blur_type_val = BLUR_TYPE_VALUES.get(blur_type, "2")
         self.kdenlive_id = (kdenlive_id or "").strip() or "opencv.tracker"
@@ -391,6 +405,8 @@ class Options:
         self.existing = existing
         self.merge_gap = int(merge_gap)
         self.split_audio = bool(split_audio)
+        # keyframe thinning: drop keyframes the interpolation reproduces within this % of the object size (0 = keep all)
+        self.thin_pct = float(thin_pct)
 
 
 def _prop(el, name, default=None):
@@ -673,6 +689,10 @@ class KdenliveProject:
         self._fid += 1
         tc = self.frame_to_tc
         coords = sorted(coords, key=lambda c: c[0])
+        dense = len(coords)
+        coords = thin_keyframes(coords, opts.thin_pct)
+        self._kf_dense += dense
+        self._kf_kept += len(coords)
         first_f, last_f = coords[0][0], coords[-1][0]
         parts = []
         if first_f > b_start:
@@ -719,6 +739,7 @@ class KdenliveProject:
         window: optional (first_frame, last_frame_or_None) on the timeline - only that part is edited.
         Returns a stats dict. The project is modified in memory; call save()."""
         self._fid = self._max_filter_id()
+        self._kf_dense = self._kf_kept = 0
         stats = dict(clips=0, processed=0, kept_existing=0, no_detections=0, not_video=0, outside_range=0,
                      pieces=0, filters=0, whole_clip_mode=0, audio_split=0, groups_rewritten=0)
         all_entries = self.list_entries()
@@ -789,6 +810,7 @@ class KdenliveProject:
             splits.append((e, pieces))
         if opts.split_audio and splits:
             self._split_audio_and_groups(splits, index, stats)
+        stats["keyframes"], stats["keyframes_dense"] = self._kf_kept, self._kf_dense
         return stats
 
     def _split_audio_and_groups(self, splits, index, stats):
@@ -885,6 +907,184 @@ def extend_tails(track_history, tail_frames):
             coords.append((lf + k, lx, ly, lw, lh))
 
 
+# ---- Track post-processing: join fragments of one object, fill holes, thin out keyframes -----------------
+# A "track" is a list of (frame, x, y, w, h); track_history maps a key like "r2_person_17" -> track.
+_TRACK_KEY = re.compile(r"^(?P<prefix>r\d+_)?(?P<cls>[A-Za-z]+)_(?P<id>\d+)$")
+
+
+def _lerp_boxes(a, b, frame):
+    """Linear interpolation of two (frame, x, y, w, h) boxes at 'frame'."""
+    t = (frame - a[0]) / float(b[0] - a[0])
+    return (frame,) + tuple(int(round(a[i] + t * (b[i] - a[i]))) for i in (1, 2, 3, 4))
+
+
+def _link_cost(ca, cb, gap):
+    """How well does track cb continue track ca after 'gap' missing frames? None = does not fit."""
+    a = ca[-1]
+    if gap < 0:                                     # B starts while A still has a few frames: compare at B's start
+        i = bisect.bisect_right([c[0] for c in ca[-8:]], cb[0][0]) - 1
+        a = ca[-8:][max(0, i)]
+    b = cb[0]
+    size = float(max(a[3], a[4], b[3], b[4], 1))
+    acx, acy = a[1] + a[3] / 2.0, a[2] + a[4] / 2.0
+    bcx, bcy = b[1] + b[3] / 2.0, b[2] + b[4] / 2.0
+    dist = math.hypot(acx - bcx, acy - bcy)
+    # the object may have kept moving while it was lost: also try A's recent velocity (capped to one object size)
+    pred = dist
+    if len(ca) >= 4 and gap > 0:
+        k = min(5, len(ca) - 1)
+        vx, vy = (acx - (ca[-1 - k][1] + ca[-1 - k][3] / 2.0)) / (ca[-1][0] - ca[-1 - k][0]), \
+                 (acy - (ca[-1 - k][2] + ca[-1 - k][4] / 2.0)) / (ca[-1][0] - ca[-1 - k][0])
+        dx, dy = vx * (gap + 1), vy * (gap + 1)
+        n = math.hypot(dx, dy)
+        if n > size:
+            dx, dy = dx * size / n, dy * size / n
+        pred = math.hypot(acx + dx - bcx, acy + dy - bcy)
+    d = min(dist, pred) / size
+    g = max(gap, 0)
+    area_ratio = (max(a[3], 1) * max(a[4], 1)) / float(max(b[3], 1) * max(b[4], 1))
+    if d > 0.5 + 0.03 * g or not (0.33 <= area_ratio <= 3.0):
+        return None
+    return d + 0.1 * abs(math.log(area_ratio)) + 0.01 * g
+
+
+def consolidate_tracks(track_history, max_gap=20, max_overlap=3):
+    """Joins fragments that belong to ONE object (the tracker often starts a new ID after a missed frame or a
+    fast movement) and fills small holes by interpolation, so the blur never drops out for a moment.
+    Works in place. Only tracks of the same kind (person/vehicle) from the same scan range are joined.
+    Returns the number of joins."""
+    if max_gap <= 0:
+        return 0
+    info = {}
+    for key, coords in track_history.items():
+        if not coords:
+            continue
+        coords.sort(key=lambda c: c[0])
+        m = _TRACK_KEY.match(key)
+        info[key] = ((m.group("prefix") or "", m.group("cls").lower()) if m else (key, ""))
+    groups = {}
+    for key, grp in info.items():
+        groups.setdefault(grp, []).append(key)
+
+    pairs = []
+    for keys in groups.values():
+        keys.sort(key=lambda k: track_history[k][0][0])
+        starts = [track_history[k][0][0] for k in keys]
+        for a in keys:
+            ca = track_history[a]
+            end_a = ca[-1][0]
+            lo = bisect.bisect_left(starts, end_a + 1 - max_overlap)
+            hi = bisect.bisect_right(starts, end_a + 1 + max_gap)
+            for b in keys[lo:hi]:
+                cb = track_history[b]
+                if b == a or cb[0][0] <= ca[0][0]:
+                    continue
+                gap = cb[0][0] - end_a - 1
+                cost = _link_cost(ca, cb, gap)
+                if cost is not None:
+                    pairs.append((cost, a, b))
+    pairs.sort()
+    succ, pred = {}, {}
+    for cost, a, b in pairs:
+        if a not in succ and b not in pred:
+            succ[a], pred[b] = b, a
+
+    joins = 0
+    for head in [k for k in info if k not in pred]:
+        if head not in succ:
+            continue
+        merged = list(track_history[head])
+        k = head
+        while k in succ:
+            k = succ[k]
+            nxt = track_history[k]
+            merged = [c for c in merged if c[0] < nxt[0][0]]            # drop an overlap, B wins
+            for f in range(merged[-1][0] + 1, nxt[0][0]):               # fill the hole
+                merged.append(_lerp_boxes(merged[-1], nxt[0], f))
+            joins += 1
+            merged.extend(nxt)
+            del track_history[k]
+        track_history[head] = merged
+    # fill small holes inside every track as well (frames the detector missed for a moment)
+    for key, coords in track_history.items():
+        out = [coords[0]] if coords else []
+        for c in coords[1:]:
+            gap = c[0] - out[-1][0] - 1
+            if 0 < gap <= max_gap:
+                out.extend(_lerp_boxes(out[-1], c, f) for f in range(out[-1][0] + 1, c[0]))
+            out.append(c)
+        track_history[key] = out
+    return joins
+
+
+def _smooth_at(kfs, f):
+    """Catmull-Rom style curve through the keyframes (frame, x, y, w, h) at 'frame' f - a stand-in for the smooth
+    interpolation Kdenlive/MLT applies between keyframes ('$=' type). Returns [x, y, w, h]."""
+    frames = [k[0] for k in kfs]
+    i = max(0, min(len(kfs) - 2, bisect.bisect_right(frames, f) - 1))
+    p0, p1, p2, p3 = kfs[max(0, i - 1)], kfs[i], kfs[i + 1], kfs[min(len(kfs) - 1, i + 2)]
+    span = float(p2[0] - p1[0])
+    t = (f - p1[0]) / span
+    t2, t3 = t * t, t * t * t
+    out = []
+    for c in (1, 2, 3, 4):
+        m1 = (p2[c] - p1[c]) if p0 is p1 else (p2[c] - p0[c]) * span / (p2[0] - p0[0])
+        m2 = (p2[c] - p1[c]) if p3 is p2 else (p3[c] - p1[c]) * span / (p3[0] - p1[0])
+        out.append((2 * t3 - 3 * t2 + 1) * p1[c] + (t3 - 2 * t2 + t) * m1 + (-2 * t3 + 3 * t2) * p2[c] + (t3 - t2) * m2)
+    return out
+
+
+def thin_keyframes(coords, pct, max_span=60):
+    """Removes keyframes that the interpolation between their neighbours reproduces within 'pct' percent of the
+    object's size (at least 2 px) - checked for straight AND smooth interpolation. Steady movement then needs only
+    a few keyframes. pct <= 0 keeps every keyframe."""
+    n = len(coords)
+    if pct <= 0 or n <= 2:
+        return list(coords)
+
+    def tol(k):
+        return max(2.0, pct / 100.0 * max(coords[k][3], coords[k][4]))
+
+    keep = [False] * n
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:                                   # 1) straight-line simplification (Douglas-Peucker in time)
+        i, j = stack.pop()
+        if j - i < 2:
+            continue
+        fi, fj = coords[i][0], coords[j][0]
+        worst, worst_k = 0.0, None
+        for k in range(i + 1, j):
+            t = (coords[k][0] - fi) / float(fj - fi)
+            err = max(abs(coords[k][c] - (coords[i][c] + t * (coords[j][c] - coords[i][c]))) for c in (1, 2, 3, 4)) / tol(k)
+            if err > worst:
+                worst, worst_k = err, k
+        if worst > 1.0:
+            split = worst_k
+        elif fj - fi > max_span:
+            split = min(range(i + 1, j), key=lambda k: abs(coords[k][0] - (fi + fj) / 2.0))
+        else:
+            continue
+        keep[split] = True
+        stack.append((i, split))
+        stack.append((split, j))
+
+    for _ in range(n):                             # 2) make sure the SMOOTH curve through the kept points is close too
+        kept = [coords[k] for k in range(n) if keep[k]]
+        worst, worst_k = 1.0, None
+        for k in range(n):
+            if keep[k]:
+                continue
+            sm = _smooth_at(kept, coords[k][0])
+            err = max(abs(coords[k][c + 1] - sm[c]) for c in range(4)) / tol(k)
+            if err > worst:
+                worst, worst_k = err, k
+        if worst_k is None:
+            break
+        keep[worst_k] = True
+    return [coords[k] for k in range(n) if keep[k]]
+
+
 def plan_cli(argv):
     if len(argv) < 2:
         print("usage: python kdenlive_blur_gui.py project.kdenlive [media_dir] [start] [end]\n"
@@ -918,6 +1118,7 @@ def plan_cli(argv):
 
 
 ka = types.SimpleNamespace(KdenliveProject=KdenliveProject, Options=Options, extend_tails=extend_tails,
+                           consolidate_tracks=consolidate_tracks, thin_keyframes=thin_keyframes,
                            parse_user_time=parse_user_time, format_clock=format_clock)
 # ======================================================================================
 
@@ -984,6 +1185,8 @@ class BlurApp:
         self.blur_type_var = tk.StringVar(value="Pixalate") # Pixalate=2, Gaussian=1, Median=0, Opaque=3
         self.kdenlive_id_var = tk.StringVar(value="opencv.tracker") # Standard default filter ID
         self.tail_buffer_var = tk.IntVar(value=3)
+        self.join_gap_var = tk.IntVar(value=20)       # join fragments of one object if the gap is at most this many frames (0 = off)
+        self.thin_pct_var = tk.DoubleVar(value=4.0)   # keyframe thinning tolerance in % of the object size (0 = every frame)
         self.media_dir_var = tk.StringVar(value="")        # optional: where the project's source videos live
         self.existing_var = tk.StringVar(value="keep")     # timeline mode: clips that already have a tracker effect
         self.preview_sec_var = tk.StringVar(value="1.0")   # preview every N seconds of video, decimals allowed, 0 = off
@@ -1160,6 +1363,14 @@ class BlurApp:
         ttk.Combobox(inf_frame, textvariable=self.existing_var, values=["keep", "replace"], state="readonly", width=18).grid(row=8, column=1, sticky="w", padx=10, pady=4)
         tk.Label(inf_frame, text="keep = clips that already have a tracker effect are left untouched, replace = redo them", fg="gray").grid(row=8, column=2, sticky="w")
 
+        tk.Label(inf_frame, text="Join Track Fragments (max gap, frames):").grid(row=9, column=0, sticky="w", pady=4)
+        tk.Spinbox(inf_frame, from_=0, to=60, increment=5, textvariable=self.join_gap_var, width=15).grid(row=9, column=1, sticky="w", padx=10, pady=4)
+        tk.Label(inf_frame, text="one person/vehicle that the tracker split into several tracks is joined; 0 = off", fg="gray").grid(row=9, column=2, sticky="w")
+
+        tk.Label(inf_frame, text="Keyframe Thinning (% of object size):").grid(row=10, column=0, sticky="w", pady=4)
+        tk.Spinbox(inf_frame, from_=0, to=15, increment=1, textvariable=self.thin_pct_var, width=15).grid(row=10, column=1, sticky="w", padx=10, pady=4)
+        tk.Label(inf_frame, text="fewer keyframes = easier to edit in Kdenlive; 0 = one keyframe per frame", fg="gray").grid(row=10, column=2, sticky="w")
+
         size_frame = tk.LabelFrame(cfg_inner, text=" Size Filtering Thresholds ", font=("Arial", 10, "bold"), padx=10, pady=10)
         size_frame.pack(fill="x", pady=10)
 
@@ -1280,6 +1491,8 @@ class BlurApp:
             "blur_type": self.blur_type_var.get(),
             "kdenlive_id": self.kdenlive_id_var.get(),
             "tail_buffer": self.tail_buffer_var.get(),
+            "join_gap": self.join_gap_var.get(),
+            "thin_pct": self.thin_pct_var.get(),
             "media_dir": self.media_dir_var.get(),
             "existing": self.existing_var.get(),
             "preview_sec": self.preview_sec_var.get(),
@@ -1303,6 +1516,8 @@ class BlurApp:
         if "blur_type" in d: self.blur_type_var.set(d["blur_type"])
         if "kdenlive_id" in d: self.kdenlive_id_var.set(d["kdenlive_id"])
         if "tail_buffer" in d: self.tail_buffer_var.set(d["tail_buffer"])
+        if "join_gap" in d: self.join_gap_var.set(d["join_gap"])
+        if "thin_pct" in d: self.thin_pct_var.set(d["thin_pct"])
         if "media_dir" in d: self.media_dir_var.set(d["media_dir"])
         if "existing" in d: self.existing_var.set(d["existing"])
         if "preview_sec" in d: self.preview_sec_var.set(str(d["preview_sec"]))
@@ -1491,6 +1706,20 @@ class BlurApp:
         self.running = False
         self.run_btn.config(state="normal", text="Start Processing & Generation", bg="#4CAF50")
 
+    @staticmethod
+    def _int_setting(var, default):
+        try:
+            return max(0, int(float(str(var.get()).replace(",", "."))))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _float_setting(var, default):
+        try:
+            return max(0.0, float(str(var.get()).replace(",", ".")))
+        except Exception:
+            return default
+
     def get_preview_frames(self, fps):
         """Preview interval in frames, from the 'seconds' field (decimals allowed, 0 = off)."""
         try:
@@ -1561,6 +1790,7 @@ class BlurApp:
             conf = self.conf_var.get()
             imgsz = self.imgsz_var.get()
             tail_buffer = self.tail_buffer_var.get()
+            join_gap = self._int_setting(self.join_gap_var, 20)
 
             if mode == "persons":
                 target_classes = [0]
@@ -1570,7 +1800,8 @@ class BlurApp:
                 target_classes = [0, 1, 2, 3, 5, 7]
 
             opts = ka.Options(blur_strength=self.blur_strength_var.get(), blur_type=self.blur_type_var.get(),
-                              kdenlive_id=self.kdenlive_id_var.get(), existing=self.existing_var.get())
+                              kdenlive_id=self.kdenlive_id_var.get(), existing=self.existing_var.get(),
+                              thin_pct=self._float_setting(self.thin_pct_var, 4.0))
 
             self.status_var.set("Status: Reading project and planning the frame ranges that are really used...")
             proj = ka.KdenliveProject(project_path)
@@ -1666,8 +1897,10 @@ class BlurApp:
                 if cancelled:
                     break
 
+            joins = 0
             for th in tracks_by_path.values():
-                ka.extend_tails(th, tail_buffer)
+                joins += ka.consolidate_tracks(th, join_gap)       # first join fragments of one object ...
+                ka.extend_tails(th, tail_buffer)                   # ... then add the tail
 
             if cancelled and done == 0:
                 self.status_var.set("Status: Cancelled before anything was processed - nothing saved.")
@@ -1684,6 +1917,8 @@ class BlurApp:
                      f"Anonymized: {stats['processed']}  (pieces: {stats['pieces']}, filters: {stats['filters']})",
                      f"Left untouched (existing tracker effect): {stats['kept_existing']}",
                      f"No detections: {stats['no_detections']}"]
+            if stats.get("keyframes_dense"):
+                lines.append(f"Keyframes written: {stats['keyframes']} (instead of {stats['keyframes_dense']}); track fragments joined: {joins}")
             if window is not None:
                 lines.append(f"Outside the time range (not touched): {stats['outside_range']}")
             if proj.warnings:
@@ -1725,6 +1960,7 @@ class BlurApp:
             conf = self.conf_var.get()
             imgsz = self.imgsz_var.get()
             tail_buffer = self.tail_buffer_var.get()
+            join_gap = self._int_setting(self.join_gap_var, 20)
             blur_intensity = self.blur_strength_var.get()
 
             if mode == "persons":
@@ -1811,7 +2047,8 @@ class BlurApp:
                 messagebox.showinfo("Cancelled", "Cancelled before anything was processed. Nothing was saved.")
                 return
 
-            # --- Apply Tail Buffer Extension ---
+            # --- Join fragments of one object, then apply the tail buffer ---
+            ka.consolidate_tracks(track_history, join_gap)
             if tail_buffer > 0:
                 for track_key, coords in track_history.items():
                     if not coords:
@@ -1964,13 +2201,26 @@ if __name__ == "__main__":
 
     CONFIG_FILE_PATH = os.path.join(get_config_dir(), "settings.json")
 
+    if os.name == "nt":
+        try:       # own taskbar identity, so the taskbar shows our icon and not the one of python.exe
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("KdenliveAutoBlurTool.App")
+        except Exception:
+            pass
     root = tk.Tk(className="Kdenlive-blur-gui")      # WM class used by the desktop launcher to match the icon
     try:                                              # window / taskbar icon (installed next to the script)
         _here = os.path.dirname(os.path.abspath(__file__))
-        for _name in ("autoblur-gui.png", APP_ID + ".png"):          # first one found is used
-            if os.path.exists(os.path.join(_here, _name)):
+        _icon_set = False
+        if os.name == "nt":                           # Windows: the multi-size .ico looks much sharper than the PNG
+            for _dir in (_here, os.path.join(_here, "assets")):
+                for _name in ("autoblur-gui.ico", APP_ID + ".ico"):
+                    if not _icon_set and os.path.exists(os.path.join(_dir, _name)):
+                        root.iconbitmap(default=os.path.join(_dir, _name))
+                        _icon_set = True
+        for _name in ("autoblur-gui.png", APP_ID + ".png"):          # Linux/macOS (and fallback): first one found
+            if not _icon_set and os.path.exists(os.path.join(_here, _name)):
                 root.iconphoto(True, tk.PhotoImage(file=os.path.join(_here, _name)))
-                break
+                _icon_set = True
     except Exception:
         pass
     app = BlurApp(root)

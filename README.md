@@ -24,6 +24,9 @@ follows them. Open the copy in Kdenlive, check it, fix what you want by hand, re
 * **Native Kdenlive effects.** One tracking effect per detected object (`opencv.tracker`), cut into
   short blocks so the effect only exists where somebody is visible. Everything stays editable.
   Audio and picture of cut clips stay grouped.
+* **Clean, editable keyframes.** If the tracker splits one person or vehicle into several tracks, they are
+  joined into a single effect and short holes are bridged, so the blur does not drop out for a moment. Steady
+  movement is reduced to a few keyframes (adjustable under *Keyframe Thinning*), which makes manual fixes easy.
 * **Existing effects are respected.** Clips that already have a tracker effect are left alone
   (or redone, your choice), so your manual work is safe.
 * **Live preview** with boxes, track IDs, timeline position, progress and time remaining.
@@ -78,7 +81,7 @@ sudo dnf install python3 python3-tkinter ffmpeg-free git
 
 #### 2. Get the tool
 ```bash
-git clone https://github.com/dietmarschnabel-code/kdenlive-blur-gui.git
+git clone https://github.com/YOUR-USER/kdenlive-blur-gui.git
 cd kdenlive-blur-gui
 ```
 (or download the ZIP from GitHub and unpack it). The whole program is the single file `kdenlive_blur_gui.py`.
@@ -180,6 +183,8 @@ and clips whose picture size differs from the project size (a warning is shown).
 |---|---|---|
 | Settings (`settings.json`) | `~/.config/kdenlive_blur_gui/` | `%APPDATA%\KdenliveBlurApp\` |
 | Downloaded Python components | `~/.local/share/kdenlive-blur-gui/venv` | `%LOCALAPPDATA%\KdenliveBlurApp\venv` |
+| YOLO model files (downloaded on first use) | `~/.local/share/kdenlive-blur-gui/models` | `%LOCALAPPDATA%\KdenliveBlurApp\models` |
+| Log file (Windows, started from the Start menu) | – | `%LOCALAPPDATA%\KdenliveBlurApp\app.log` |
 
 **Uninstall:** remove the package (`sudo apt remove kdenlive-blur-gui` / `sudo dnf remove kdenlive-blur-gui` /
 Windows *Apps & features*), then delete the two folders above if you want to get the space back.
@@ -194,17 +199,21 @@ Windows *Apps & features*), then delete the two folders above if you want to get
 | pip finds no PyTorch for your Python | Your Python is newer than PyTorch supports. Install an older one (e.g. `sudo dnf install python3.12`) and run `python3.12 kdenlive_blur_gui.py --install-deps`. |
 | `libGL.so.1` / `libglib` error | `sudo apt install libgl1 libglib2.0-0` (Fedora: `sudo dnf install mesa-libGL`) |
 | "ffmpeg was not found" (check video) | Debian: `sudo apt install ffmpeg` · Fedora: `sudo dnf install ffmpeg-free` · Windows: `winget install Gyan.FFmpeg` |
+| "Download failure" for a YOLO model | The model is downloaded from GitHub on first use. Check internet/firewall, or download the `.pt` file from <https://github.com/ultralytics/assets/releases> and put it into the `models` folder above. |
 | "Source video(s) not found" | Set **Media Folder** to the folder that contains the project's videos. |
 | Intel GPU not used / error on first run | Install the Intel compute runtime (see above) or set **Execution Device (Hardware)** to `cpu`. |
+| One person gets several separate effects / the blur flickers | Raise **Join Track Fragments** (max gap in frames) in the *Advanced Configuration* tab. Lower it if two different people get joined. |
+| Too many keyframes, or the blur lags on a sharp turn | **Keyframe Thinning**: a higher value gives fewer keyframes, a lower value (e.g. 2) follows fast turns more closely, `0` writes one keyframe per frame. |
 | Blur sits slightly off at a cut | Increase **Tail Buffer Extension** or lower the **Confidence Threshold** in the *Advanced Configuration* tab; fine-tune by hand in Kdenlive. |
 
 ## Building the packages
 
-Run these from a clone of the repository. The AGPL-3.0 license text is included in `LICENSE`.
+Run these from a clone of the repository. Put the GPL-3.0 text into a file named `LICENSE` first:
+`curl -L -o LICENSE https://www.gnu.org/licenses/gpl-3.0.txt`
 
 ```bash
 # Debian / Ubuntu  (needs dpkg-deb)
-MAINTAINER="Dietmar Schnabel <dietmar.schnabel<at>gmail.com>" HOMEPAGE="https://github.com/dietmarschnabel-code/kdenlive-blur-gui" ./packaging/linux/build-deb.sh
+MAINTAINER="Your Name <you@example.com>" HOMEPAGE="https://github.com/YOUR-USER/kdenlive-blur-gui" ./packaging/linux/build-deb.sh
 #   -> dist/kdenlive-blur-gui_<version>_all.deb
 
 # Fedora  (sudo dnf install rpm-build desktop-file-utils)
@@ -220,8 +229,8 @@ The version number is `__version__` in `kdenlive_blur_gui.py`; keep the `Version
 
 ## License
 
-The Kdenlive Auto-Blur Tool is free software, licensed under the **GNU Affero General Public License,
-version 3 or later** (see `LICENSE`).
+The Kdenlive Auto-Blur Tool is free software, licensed under the **GNU General Public License, version 3 or
+later** (see `LICENSE`).
 
 It uses these components, which are installed separately and keep their own licenses:
 [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) (AGPL-3.0, also for the model files it downloads),
