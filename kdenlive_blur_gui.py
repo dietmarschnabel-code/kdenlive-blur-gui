@@ -23,6 +23,7 @@ import json
 import platform
 import subprocess
 import shutil
+import traceback
 
 # ======================================================================================
 # Dependency bootstrap - only standard library. If a required component is missing the
@@ -43,6 +44,34 @@ def _data_dir():
 
 
 VENV_DIR = os.path.join(_data_dir(), "venv")
+MODELS_DIR = os.path.join(_data_dir(), "models")      # YOLO weights (and their OpenVINO export) live here
+_LOG_PATH = None
+
+
+def _ensure_std_streams():
+    """Windows shortcuts start the tool with pythonw.exe: no console, so sys.stdout and sys.stderr are None.
+    Libraries that print progress bars (the model download of Ultralytics, pip, ...) then crash with
+    "'NoneType' object has no attribute 'write'". Send the output to a log file instead."""
+    global _LOG_PATH
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        os.makedirs(_data_dir(), exist_ok=True)
+        path = os.path.join(_data_dir(), "app.log")
+        if os.path.exists(path) and os.path.getsize(path) > 1000000:
+            os.replace(path, path + ".old")
+        log = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+        log.write("\n--- %s %s started %s ---\n" % (APP_NAME, __version__, time.strftime("%Y-%m-%d %H:%M:%S")))
+        _LOG_PATH = path
+    except OSError:
+        log = open(os.devnull, "w")
+    if sys.stdout is None:
+        sys.stdout = log
+    if sys.stderr is None:
+        sys.stderr = log
+
+
+_ensure_std_streams()
 
 
 def _venv_python(windowed=False):
@@ -84,6 +113,19 @@ def system_package_hint(what):
         ("ffmpeg", "windows"): "winget install Gyan.FFmpeg   (or download it from https://ffmpeg.org and add it to PATH)",
     }
     return table.get((what, d), "install the '%s' package of your system" % what)
+
+
+def describe_error(e):
+    """Text for the error dialog: the message, a hint for the usual download problem, and where the log is."""
+    text = str(e)
+    msg = "An error occurred:\n%s" % text
+    low = text.lower()
+    if "download failure" in low or "retry limit" in low:
+        msg += ("\n\nThe YOLO model file could not be downloaded. Check your internet connection and firewall and try again.\n"
+                "Or download the file yourself from https://github.com/ultralytics/assets/releases and put it into:\n  " + MODELS_DIR)
+    if _LOG_PATH:
+        msg += "\n\nMore details: " + _LOG_PATH
+    return msg
 
 
 def _fatal(title, message):
@@ -879,12 +921,49 @@ ka = types.SimpleNamespace(KdenliveProject=KdenliveProject, Options=Options, ext
                            parse_user_time=parse_user_time, format_clock=format_clock)
 # ======================================================================================
 
+def compute_window_size(screen_w, screen_h, saved=None):
+    """Window size that fits the screen -> (width, height, min_width, min_height).
+    Leaves room for the title bar and the taskbar, so it also works on 1280x720 screens.
+    'saved' is the size the user had last time (kept if it still fits this screen)."""
+    avail_w = max(640, screen_w - 20)
+    avail_h = max(480, int(screen_h * 0.88))
+    if saved and saved[0] > 0 and saved[1] > 0:
+        w, h = min(int(saved[0]), screen_w), min(int(saved[1]), max(avail_h, screen_h - 60))
+    else:
+        w, h = min(1100, avail_w), min(860, avail_h)
+    min_w, min_h = min(780, avail_w), min(520, avail_h)
+    return max(w, min_w), max(h, min_h), min_w, min_h
+
+
+class ScrollableFrame(ttk.Frame):
+    """A frame whose content scrolls vertically (scrollbar + mouse wheel) if the window is too small for it."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.vbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.inner = ttk.Frame(self.canvas)
+        self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self._window, width=e.width))
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):      # Windows/macOS, Linux up, Linux down
+            self.canvas.bind_all(seq, self._on_wheel, add="+")
+
+    def _on_wheel(self, event):
+        if not self.winfo_viewable() or self.inner.winfo_reqheight() <= self.canvas.winfo_height():
+            return
+        num = getattr(event, "num", None)
+        step = -1 if num == 4 else 1 if num == 5 else (-1 if event.delta > 0 else 1)
+        self.canvas.yview_scroll(step * 3, "units")
+
+
 class BlurApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("1025x1340")
-        self.root.resizable(False, False)
+        self.saved_window_size = None        # from the settings file; the window then opens in the size you left it
 
         # --- Configuration Variables ---
         self.input_path = tk.StringVar()
@@ -925,19 +1004,48 @@ class BlurApp:
         self.photo_ref = None
         self.preview_image_id = None
         self.preview_text_id = None
+        self.preview_src = None              # last preview frame (small PIL image), redrawn when the window is resized
 
         # Load saved settings on startup
         self.load_settings_from_disk(CONFIG_FILE_PATH, silent=True)
 
         self.create_widgets()
+        self.setup_window()
+
+    def setup_window(self):
+        """Size the window to the screen (works down to 1280x720), resizable, remembers the size you choose."""
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        w, h, min_w, min_h = compute_window_size(sw, sh, self.saved_window_size)
+        x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 4)
+        self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        self.root.minsize(min_w, min_h)
+        self.root.resizable(True, True)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def current_window_size(self):
+        try:
+            if self.root.winfo_viewable():
+                return [self.root.winfo_width(), self.root.winfo_height()]
+        except Exception:
+            pass
+        return list(self.saved_window_size) if self.saved_window_size else None
+
+    def on_close(self):
+        if self.running and not messagebox.askyesno(
+                "Quit", "Processing is still running.\nQuit without saving the results so far?\n\n"
+                        "(Use 'Cancel & Save Progress' to keep them.)"):
+            return
+        self.save_current_settings(silent=True)
+        self.cancel_event.set()
+        self.root.destroy()
 
     def create_widgets(self):
-        title_label = tk.Label(self.root, text="Landscape Privacy Anonymizer & Verifier", font=("Arial", 16, "bold"))
-        title_label.pack(pady=5)
+        # the status line is packed first (at the bottom) so it is never pushed out of a small window
+        tk.Label(self.root, textvariable=self.status_var, font=("Arial", 9, "italic"), fg="gray", anchor="w").pack(side="bottom", fill="x", padx=15, pady=2)
 
         # --- Main Notebook (Tabs) ---
         notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=15, pady=5)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(6, 2))
 
         tab_main = ttk.Frame(notebook)
         tab_config = ttk.Frame(notebook)
@@ -946,79 +1054,79 @@ class BlurApp:
         notebook.add(tab_config, text=" Advanced Configuration ")
 
         # ================= TAB 1: MAIN PROCESSING =================
-        file_frame = tk.LabelFrame(tab_main, text=" File Configuration ", font=("Arial", 10, "bold"), padx=10, pady=5)
-        file_frame.pack(fill="x", padx=10, pady=5)
+        file_frame = tk.LabelFrame(tab_main, text=" Files ", font=("Arial", 10, "bold"), padx=10, pady=4)
+        file_frame.pack(fill="x", padx=8, pady=(6, 3))
+        file_frame.columnconfigure(1, weight=1)          # the path fields stretch with the window
 
         self.input_label = tk.Label(file_frame, text="Kdenlive Project:")
         self.input_label.grid(row=0, column=0, sticky="w", pady=2)
-        tk.Entry(file_frame, textvariable=self.input_path, width=62).grid(row=0, column=1, padx=5, pady=2)
+        tk.Entry(file_frame, textvariable=self.input_path, width=20).grid(row=0, column=1, sticky="ew", padx=5, pady=2)
         tk.Button(file_frame, text="Browse...", command=self.browse_input).grid(row=0, column=2, pady=2)
 
         tk.Label(file_frame, text="Output Target:").grid(row=1, column=0, sticky="w", pady=2)
-        tk.Entry(file_frame, textvariable=self.output_path, width=62).grid(row=1, column=1, padx=5, pady=2)
+        tk.Entry(file_frame, textvariable=self.output_path, width=20).grid(row=1, column=1, sticky="ew", padx=5, pady=2)
         tk.Button(file_frame, text="Save As...", command=self.browse_output).grid(row=1, column=2, pady=2)
 
         media_label = tk.Label(file_frame, text="Media Folder (optional):")
         media_label.grid(row=2, column=0, sticky="w", pady=2)
-        media_entry = tk.Entry(file_frame, textvariable=self.media_dir_var, width=62)
-        media_entry.grid(row=2, column=1, padx=5, pady=2)
+        media_entry = tk.Entry(file_frame, textvariable=self.media_dir_var, width=20)
+        media_entry.grid(row=2, column=1, sticky="ew", padx=5, pady=2)
         media_button = tk.Button(file_frame, text="Browse...", command=self.browse_media_dir)
         media_button.grid(row=2, column=2, pady=2)
         self.media_widgets = [media_label, media_entry, media_button]   # only used in project mode
 
-        # Time Range & Quick Options
-        time_frame = tk.LabelFrame(tab_main, text=" Time Range (optional) - Kdenlive: timeline time as HH:MM:SS, MKV: video time ", font=("Arial", 10, "bold"), padx=10, pady=5)
-        time_frame.pack(fill="x", padx=10, pady=5)
+        # Time range and quick options share one compact frame
+        self.opt_frame = tk.LabelFrame(tab_main, text=" Range & Options ", font=("Arial", 10, "bold"), padx=10, pady=4)
+        self.opt_frame.pack(fill="x", padx=8, pady=3)
 
-        tk.Label(time_frame, text="Start Time (empty = from the beginning):").grid(row=0, column=0, sticky="w", pady=2)
-        start_entry = tk.Entry(time_frame, textvariable=self.start_time_var, width=18)
+        tk.Label(self.opt_frame, text="Start (empty = beginning):").grid(row=0, column=0, sticky="w", pady=2)
+        start_entry = tk.Entry(self.opt_frame, textvariable=self.start_time_var, width=11)
         start_entry.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-
-        tk.Label(time_frame, text="End Time (empty = until the end):").grid(row=0, column=2, sticky="w", pady=2, padx=(15, 0))
-        end_entry = tk.Entry(time_frame, textvariable=self.end_time_var, width=18)
+        tk.Label(self.opt_frame, text="End (empty = end):").grid(row=0, column=2, sticky="w", pady=2, padx=(15, 0))
+        end_entry = tk.Entry(self.opt_frame, textvariable=self.end_time_var, width=11)
         end_entry.grid(row=0, column=3, sticky="w", padx=5, pady=2)
         self.time_entries = [start_entry, end_entry]
+        self.time_hint = tk.Label(self.opt_frame, text="", fg="gray")
+        self.time_hint.grid(row=0, column=4, sticky="w", padx=(10, 0))
 
-        quick_frame = tk.Frame(tab_main, pady=5)
-        quick_frame.pack(fill="x", padx=10)
-
-        tk.Label(quick_frame, text="Mode (kdenlive = edit project):").grid(row=0, column=0, sticky="w", pady=2)
-        self.export_combo = ttk.Combobox(quick_frame, textvariable=self.export_mode_var, values=["kdenlive", "mkv"], state="readonly", width=10)
-        self.export_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        tk.Label(self.opt_frame, text="Mode:").grid(row=1, column=0, sticky="w", pady=2)
+        self.export_combo = ttk.Combobox(self.opt_frame, textvariable=self.export_mode_var, values=["kdenlive", "mkv"], state="readonly", width=9)
+        self.export_combo.grid(row=1, column=1, sticky="w", padx=5, pady=2)
         self.export_combo.bind("<<ComboboxSelected>>", self.on_export_mode_changed)
+        tk.Label(self.opt_frame, text="Detect:").grid(row=1, column=2, sticky="w", pady=2, padx=(15, 0))
+        ttk.Combobox(self.opt_frame, textvariable=self.mode_var, values=["both", "vehicles", "persons"], state="readonly", width=9).grid(row=1, column=3, sticky="w", padx=5, pady=2)
+        tk.Label(self.opt_frame, text="Preview every (s, 0 = off):").grid(row=1, column=4, sticky="w", pady=2, padx=(10, 0))
+        tk.Entry(self.opt_frame, textvariable=self.preview_sec_var, width=6).grid(row=1, column=5, sticky="w", padx=5, pady=2)
 
-        tk.Label(quick_frame, text="Target Mode:").grid(row=0, column=2, sticky="w", pady=2, padx=(20, 0))
-        ttk.Combobox(quick_frame, textvariable=self.mode_var, values=["both", "vehicles", "persons"], state="readonly", width=15).grid(row=0, column=3, sticky="w", padx=5, pady=2)
-
-        tk.Label(quick_frame, text="Preview Interval (seconds, 0 = off):").grid(row=1, column=0, sticky="w", pady=2)
-        tk.Entry(quick_frame, textvariable=self.preview_sec_var, width=8).grid(row=1, column=1, sticky="w", padx=5, pady=2)
-        tk.Label(quick_frame, text="decimals allowed, e.g. 0.5 = twice per video second", fg="gray").grid(row=1, column=2, columnspan=2, sticky="w", padx=(20, 0))
+        tk.Label(self.opt_frame, text="Mode kdenlive: edit a project - mode mkv: render a check video from a video file. "
+                                      "Preview interval: decimals allowed, e.g. 0.5.", fg="gray", font=("Arial", 8)
+                 ).grid(row=2, column=0, columnspan=6, sticky="w")
 
         self.run_btn = tk.Button(tab_main, text="Start Processing & Generation", bg="#4CAF50", fg="white", font=("Arial", 11, "bold"), command=self.on_run_button)
-        self.run_btn.pack(fill="x", padx=10, pady=8)
+        self.run_btn.pack(fill="x", padx=8, pady=5)
 
-        # Live Preview (16:9 Canvas)
-        preview_frame = tk.LabelFrame(tab_main, text=" Live Processing Preview (16:9 Aspect Ratio, interval adjustable above) ", font=("Arial", 10, "bold"), padx=10, pady=5)
-        preview_frame.pack(fill="x", padx=10, pady=5)
+        # counts and time remaining in one line below the preview (packed before the preview so they keep their space)
+        info_frame = tk.Frame(tab_main)
+        info_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
+        tk.Label(info_frame, textvariable=self.counts_var, font=("Arial", 9, "bold")).pack(side="left")
+        tk.Label(info_frame, textvariable=self.eta_var, font=("Arial", 9, "bold", "italic"), fg="#1976D2").pack(side="right")
 
-        self.preview_canvas = tk.Canvas(preview_frame, width=960, height=540, bg="black")
-        self.preview_canvas.pack(pady=3)
+        # Live preview: takes all remaining space, the picture always fits (16:9 or whatever the video is)
+        preview_frame = tk.LabelFrame(tab_main, text=" Live Preview ", font=("Arial", 10, "bold"), padx=6, pady=3)
+        preview_frame.pack(fill="both", expand=True, padx=8, pady=3)
+
+        self.preview_canvas = tk.Canvas(preview_frame, width=320, height=180, bg="black", highlightthickness=0)
+        self.preview_canvas.pack(fill="both", expand=True)
         self.preview_text_id = self.preview_canvas.create_text(
-            480, 270, text="Preview will appear here when processing starts", fill="white", font=("Arial", 12)
+            160, 90, text="The preview appears here when processing starts", fill="white", font=("Arial", 11)
         )
-
-        # Stats & ETA
-        stats_frame = tk.LabelFrame(tab_main, text=" Progress & Statistics ", font=("Arial", 10, "bold"), padx=10, pady=5)
-        stats_frame.pack(fill="x", padx=10, pady=5)
-
-        tk.Label(stats_frame, textvariable=self.counts_var, font=("Arial", 9, "bold")).pack(anchor="w", pady=1)
-        tk.Label(stats_frame, textvariable=self.eta_var, font=("Arial", 9, "bold", "italic"), fg="#1976D2").pack(anchor="w", pady=1)
-
-        tk.Label(self.root, textvariable=self.status_var, font=("Arial", 9, "italic"), fg="gray").pack(pady=2)
+        self.preview_canvas.bind("<Configure>", self.on_preview_resize)
 
 
         # ================= TAB 2: ADVANCED CONFIGURATION =================
-        cfg_inner = tk.Frame(tab_config, padx=15, pady=15)
+        cfg_scroll = ScrollableFrame(tab_config)        # scrolls if the window is too small to show everything
+        cfg_scroll.pack(fill="both", expand=True)
+        cfg_inner = tk.Frame(cfg_scroll.inner, padx=15, pady=10)
         cfg_inner.pack(fill="both", expand=True)
 
         inf_frame = tk.LabelFrame(cfg_inner, text=" YOLO Inference & Hardware Parameters ", font=("Arial", 10, "bold"), padx=10, pady=10)
@@ -1093,6 +1201,7 @@ class BlurApp:
         """Show only the fields that make sense for the selected mode."""
         project = self.export_mode_var.get() != "mkv"
         self.input_label.config(text="Kdenlive Project:" if project else "Input Video:")
+        self.time_hint.config(text="timeline time, HH:MM:SS" if project else "video time, HH:MM:SS")
         for w in self.media_widgets:
             if project:
                 w.grid()
@@ -1179,7 +1288,8 @@ class BlurApp:
             "veh_min_h": self.veh_min_h_var.get(),
             "veh_min_area": self.veh_min_area_var.get(),
             "input_path": self.input_path.get(),
-            "output_path": self.output_path.get()
+            "output_path": self.output_path.get(),
+            "window_size": self.current_window_size()
         }
 
     def apply_settings_dict(self, d):
@@ -1202,6 +1312,9 @@ class BlurApp:
         if "veh_min_area" in d: self.veh_min_area_var.set(d["veh_min_area"])
         if "input_path" in d: self.input_path.set(d["input_path"])
         if "output_path" in d: self.output_path.set(d["output_path"])
+        ws = d.get("window_size")
+        if isinstance(ws, (list, tuple)) and len(ws) == 2:
+            self.saved_window_size = (ws[0], ws[1])      # used at the next start only
 
     def save_current_settings(self, silent=False):
         try:
@@ -1245,17 +1358,24 @@ class BlurApp:
     def load_yolo_model(self):
         chosen_model = self.model_var.get()
         device_choice = self.device_var.get()
-        
+
+        # weights and the OpenVINO export always go to one fixed, writable folder - never into the
+        # current working directory (which can be the install folder or the home directory)
+        os.makedirs(MODELS_DIR, exist_ok=True)
+        weights = os.path.join(MODELS_DIR, chosen_model)
+        if not os.path.exists(weights):
+            self.status_var.set(f"Status: Downloading {chosen_model} (first use only, needs internet)...")
+
         if device_choice.startswith("intel:"):
-            base_name, _ = os.path.splitext(chosen_model)
+            base_name, _ = os.path.splitext(weights)
             ov_dir = f"{base_name}_openvino_model"
             if not os.path.exists(ov_dir):
-                self.status_var.set(f"Status: Exporting {chosen_model} to OpenVINO format for Intel hardware...")
-                temp_model = YOLO(chosen_model)
+                self.status_var.set(f"Status: Exporting {chosen_model} to OpenVINO format for Intel hardware (first use only)...")
+                temp_model = YOLO(weights)
                 temp_model.export(format="openvino", half=True)
             return YOLO(ov_dir, task="detect")
         else:
-            return YOLO(chosen_model, task="detect")
+            return YOLO(weights, task="detect")
 
     def parse_time_to_frame(self, t_str, fps, max_frames, is_end=False):
         t_str = t_str.strip()
@@ -1296,18 +1416,34 @@ class BlurApp:
 
         preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(preview_rgb)
-        img_pil.thumbnail((960, 540))
-        
-        self.photo_ref = ImageTk.PhotoImage(img_pil)
-        
+        img_pil.thumbnail((1280, 720))                    # enough for any preview size, cheap to redraw when resized
+        self.preview_src = img_pil
+        self.draw_preview()
+
+    def draw_preview(self):
+        """Draws the last preview frame scaled to fit the canvas (keeps the aspect ratio)."""
+        if self.preview_src is None:
+            return
+        cw, ch = max(2, self.preview_canvas.winfo_width()), max(2, self.preview_canvas.winfo_height())
+        img = self.preview_src.copy()
+        img.thumbnail((cw, ch))
+        self.photo_ref = ImageTk.PhotoImage(img)
+
         if self.preview_text_id:
             self.preview_canvas.delete(self.preview_text_id)
             self.preview_text_id = None
-            
+
         if self.preview_image_id is None:
-            self.preview_image_id = self.preview_canvas.create_image(480, 270, anchor=tk.CENTER, image=self.photo_ref)
+            self.preview_image_id = self.preview_canvas.create_image(cw // 2, ch // 2, anchor=tk.CENTER, image=self.photo_ref)
         else:
+            self.preview_canvas.coords(self.preview_image_id, cw // 2, ch // 2)
             self.preview_canvas.itemconfig(self.preview_image_id, image=self.photo_ref)
+
+    def on_preview_resize(self, event):
+        if self.preview_text_id:
+            self.preview_canvas.coords(self.preview_text_id, event.width // 2, event.height // 2)
+        elif self.preview_src is not None:
+            self.draw_preview()
 
     def start_processing_thread(self):
         inp = self.input_path.get()
@@ -1464,7 +1600,8 @@ class BlurApp:
             end_ts = ka.format_clock(last_frame_tl / proj.fps)
 
             model = self.load_yolo_model()
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hw_accel;vaapi"
+            if sys.platform.startswith("linux"):
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hw_accel;vaapi"       # VAAPI exists on Linux only
 
             tracks_by_path = {}
             range_count = {}
@@ -1570,7 +1707,8 @@ class BlurApp:
 
         except Exception as e:
             self.status_var.set("Status: Error during processing.")
-            messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+            traceback.print_exc()
+            messagebox.showerror("Error", describe_error(e))
         finally:
             self.finish_run()
 
@@ -1598,7 +1736,8 @@ class BlurApp:
 
             model = self.load_yolo_model()
 
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hw_accel;vaapi"
+            if sys.platform.startswith("linux"):
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hw_accel;vaapi"       # VAAPI exists on Linux only
             cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG, (cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY))
             if not cap.isOpened():
                 cap = cv2.VideoCapture(video_path)
@@ -1703,7 +1842,8 @@ class BlurApp:
 
         except Exception as e:
             self.status_var.set("Status: Error during processing.")
-            messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+            traceback.print_exc()
+            messagebox.showerror("Error", describe_error(e))
         finally:
             self.finish_run()
 
@@ -1795,7 +1935,8 @@ class BlurApp:
                 "-t", str(duration_sec),
                 output_mkv_path
             ]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    creationflags=(0x08000000 if os.name == "nt" else 0))
             if result.returncode == 0:
                 mux_success = True
         except Exception:
@@ -1825,9 +1966,11 @@ if __name__ == "__main__":
 
     root = tk.Tk(className="Kdenlive-blur-gui")      # WM class used by the desktop launcher to match the icon
     try:                                              # window / taskbar icon (installed next to the script)
-        _icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), APP_ID + ".png")
-        if os.path.exists(_icon):
-            root.iconphoto(True, tk.PhotoImage(file=_icon))
+        _here = os.path.dirname(os.path.abspath(__file__))
+        for _name in ("autoblur-gui.png", APP_ID + ".png"):          # first one found is used
+            if os.path.exists(os.path.join(_here, _name)):
+                root.iconphoto(True, tk.PhotoImage(file=os.path.join(_here, _name)))
+                break
     except Exception:
         pass
     app = BlurApp(root)
