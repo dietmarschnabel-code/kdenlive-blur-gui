@@ -6,3 +6,4 @@ for size in 16 24 32 48 64 128 256 512; do
     -resize ${size}x${size} \
     icons/${size}.png
 done
+magick convert icons/256.png -define icon:auto-resize=256,64,32,16 kdenlive-blur-gui.ico
