@@ -18,7 +18,7 @@ Run:            python3 kdenlive_blur_gui.py
 Dry run:        python3 kdenlive_blur_gui.py project.kdenlive [media_folder] [start] [end]
 Repair/install: python3 kdenlive_blur_gui.py --install-deps
 """
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 APP_NAME = "Kdenlive Auto-Blur Tool"
 
 import os
