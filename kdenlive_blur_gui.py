@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 Kdenlive Auto-Blur Tool contributors
+# Copyright (C) 2026 Dietmar Schnabel <dietmar.schnabel<at>gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify it under the terms of the
+# GNU Affero General Public License as published by the Free Software Foundation, either version 3 of
+# the License, or (at your option) any later version. It is distributed in the hope that it will be
+# useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License (file LICENSE) for details.
 """
 Kdenlive Auto-Blur Tool
 =======================
@@ -887,6 +893,373 @@ class KdenliveProject:
             stats["groups_rewritten"] = len(replaced)
             prop.text = json.dumps(out, indent=4)
 
+    # ------------------------------------------------- merge the effects of another project into this one
+    @staticmethod
+    def _norm_path(p):
+        return os.path.normpath((p or "").replace("\\", "/")).replace("\\", "/").lower()
+
+    def _media_keys(self, e):
+        """(full normalized path, lower-case file name) of the media file a clip entry uses."""
+        raw = e.raw_path
+        is_abs = os.path.isabs(raw) or bool(re.match(r"^[A-Za-z]:[\\/]", raw))
+        full = raw if is_abs else os.path.join(self.media_root, raw)
+        return self._norm_path(full), os.path.basename(raw.replace("\\", "/")).lower()
+
+    @staticmethod
+    def _wanted_filter(f, scope):
+        service = _prop(f, "mlt_service", "")
+        if service == TRACKER_SERVICE:
+            return True
+        # other effects: only simple ones (a filter with its own in/out would not keep its meaning on a different cut)
+        return scope == "all" and bool(service) and not (f.get("in") or f.get("out"))
+
+    def media_with_effects(self, scope="blur"):
+        """Media files that carry effects in this project: [(key, name, number of effects, first frame, last frame)]."""
+        out = {}
+        for e in self.list_entries(video_only=True):
+            if e.raw_path is None:
+                continue
+            n = len([f for f in e.el.findall("filter") if self._wanted_filter(f, scope)])
+            if n:
+                rec = out.setdefault(self._media_keys(e)[0], [os.path.basename(e.raw_path.replace("\\", "/")), 0, e.in_f, e.out_f])
+                rec[1] += n
+                rec[2], rec[3] = min(rec[2], e.in_f), max(rec[3], e.out_f)
+        return sorted(((k, v[0], v[1], v[2], v[3]) for k, v in out.items()), key=lambda r: -r[2])
+
+    def video_media(self):
+        """Media files used on the video tracks: [(key, name, number of clips)]."""
+        out = {}
+        for e in self.list_entries(video_only=True):
+            if e.raw_path is not None:
+                rec = out.setdefault(self._media_keys(e)[0], [os.path.basename(e.raw_path.replace("\\", "/")), 0])
+                rec[1] += 1
+        return sorted(((k, v[0], v[1]) for k, v in out.items()), key=lambda r: r[1].lower())
+
+    def video_tracks(self):
+        """Video tracks that hold clips: [(track id, number of clips)]."""
+        out = {}
+        for e in self.list_entries(video_only=True):
+            out[e.track.id] = out.get(e.track.id, 0) + 1
+        return sorted(out.items())
+
+    def _frames_prop(self, el, name):
+        """Value of a property as frames (Kdenlive writes lengths as a frame count, sometimes as a clock time)."""
+        v = (_prop(el, name, "") if el is not None else "") or ""
+        try:
+            return self.parse_time(v) if ":" in v else int(float(v))
+        except ValueError:
+            return 0
+
+    def footage_axis(self):
+        """How this project's timeline relates to a CONTINUOUS recording, when cuts inside a file are undone.
+        Example: a clip of one file was cut in two pieces and 702 frames between them were thrown away. A video that was
+        rendered BEFORE that cut still contains those frames, so its time axis runs 702 frames ahead of the timeline
+        from there on. Returns (offsets, total_shift, timeline_length, main_track_id) where offsets[media key] is the
+        position on that 'continuous' axis at which frame 0 of the file lies."""
+        entries = [e for e in self.list_entries(video_only=True) if e.raw_path is not None]
+        if not entries:
+            return {}, 0, 0, None
+        per_track = {}
+        for e in entries:
+            per_track[e.track.id] = per_track.get(e.track.id, 0) + 1
+        main = max(per_track, key=lambda t: (per_track[t], -t))        # the track that carries the story
+        clips = sorted((e for e in entries if e.track.id == main), key=lambda e: e.pos)
+        shift, steps = 0, [(clips[0].pos, 0)]
+        for a, b in zip(clips, clips[1:]):
+            if self._media_keys(a)[0] == self._media_keys(b)[0]:
+                gap = b.in_f - (a.out_f + 1)                           # footage skipped between the two pieces of one file
+                if gap > 0:
+                    shift += gap - (b.pos - (a.pos + a.length))        # minus blank frames left on the timeline
+            steps.append((b.pos, shift))
+
+        def shift_at(pos):
+            last = 0
+            for p, sh in steps:
+                if p > pos:
+                    break
+                last = sh
+            return last
+
+        offsets = {}
+        for e in sorted(entries, key=lambda e: (e.track.id != main, e.pos)):   # main track first, then the others
+            offsets.setdefault(self._media_keys(e)[0], e.pos + shift_at(e.pos) - e.in_f)
+        return offsets, shift, max(c.pos + c.length for c in clips), main
+
+    def plan_merge(self, source, scope="blur", existing="keep", mode="pair", src_media=None, dst_media=None, offset=0, track=None,
+                   restore_cuts="auto", same_files=True):
+        """Plans copying the effects of the project 'source' (and the cuts they need) onto clips of THIS project.
+        The effects are tied to the TIME in the source video, so the target may use different files.
+          mode 'pair': source video -> target video file. Automatic by file path / unique file name, or manual: the
+                       source video 'src_media' goes to the file 'dst_media' (keys from media_with_effects/video_media).
+                       Target file time = source video time + offset (frames). Stops where the target file ends.
+          mode 'time': source time 0 sits at timeline position 'offset' (frames) of this project; the effects
+                       go onto whatever clips are there (all video tracks, or only track id 'track').
+                       A source with ONE video (a rendered edit): that video's own time is the axis. A source with SEVERAL
+                       videos / tracks: every video is placed where the source project puts it, and the effects of ALL
+                       of them are copied (src_media=None) or only those of one video.
+                       Stops where the target has no clips any more.
+                       same_files: a source video that is ALSO used in the target (same path, or same unique file name)
+                       is copied exactly by file - its effects land on the same frames of that file, whatever the cuts and
+                       positions are (needs offset 0). Only the other source videos are placed by the timeline.
+                       restore_cuts: the source video may have been rendered BEFORE the target got cuts inside its files
+                       (footage thrown away) - then the video still contains that footage. 'yes' = undo such cuts for the
+                       mapping, 'no' = use the timeline as it is, 'auto' = decide by comparing the video's length with
+                       the target's timeline (only when offset is 0).
+        scope 'blur' = tracker (blur) effects only, 'all' = also other simple effects.
+        Nothing is changed here. Returns (plan, report_lines)."""
+        ann, bases, src_len = {}, {}, {}         # full path -> [(first, last, [filters], name)]; file name -> {full paths}; video lengths
+        n_src_filters = 0
+        for e in source.list_entries(video_only=True):
+            if e.raw_path is None:
+                continue
+            flts = [f for f in e.el.findall("filter") if self._wanted_filter(f, scope)]
+            full, base = source._media_keys(e)
+            if not flts or (src_media is not None and full != src_media):
+                continue
+            a, b = self.parse_time(e.el.get("in")), self.parse_time(e.el.get("out"))     # video time, as frames of THIS project
+            src_len[full] = max(src_len.get(full, 0), self._frames_prop(source.by_id.get(e.el.get("producer")), "length"), b + 1)
+            ann.setdefault(full, []).append((a, b, flts, os.path.basename(e.raw_path.replace("\\", "/"))))
+            bases.setdefault(base, set()).add(full)
+            n_src_filters += len(flts)
+        ident = {}                                 # source video -> the same file in the target (copied exactly by file)
+        if mode == "time" and ann and same_files and offset == 0:
+            tkeys = {k for k, n, c in self.video_media()}
+            tbase = {}
+            for k in tkeys:
+                tbase.setdefault(os.path.basename(k), set()).add(k)
+            for skey in ann:
+                cands = {skey} & tkeys or (tbase.get(os.path.basename(skey), set()) if len(tbase.get(os.path.basename(skey), ())) == 1 else set())
+                if cands:
+                    ident[skey] = next(iter(cands))
+        timed = [k for k in ann if k not in ident]  # source videos that are placed by the timeline
+        axis_src = {}                              # per such video: where its frame 0 lies on the source's time axis
+        if mode == "time" and timed:
+            all_media = {source._media_keys(e)[0] for e in source.list_entries(video_only=True) if e.raw_path is not None}
+            if len(all_media) <= 1:
+                axis_src = {k: 0 for k in timed}   # one video (e.g. a rendered edit): its own time IS the axis
+            else:                                  # several videos / tracks: each lies where the source project puts it
+                src_offsets = source.footage_axis()[0]
+                axis_src = {k: int(round(src_offsets.get(k, 0) / source.fps * self.fps)) for k in timed}
+
+        axis_report = []
+        file_offsets = {}
+        restore = False
+        if mode == "time" and timed:
+            file_offsets, total_shift, tl_len, main_track = self.footage_axis()
+            if total_shift > 0:
+                if restore_cuts == "yes":
+                    restore = True
+                elif restore_cuts == "auto" and offset == 0 and any(k in timed for k in src_len):
+                    L = max(axis_src.get(k, 0) + n for k, n in src_len.items() if k in timed)
+                    restore = abs(L - (tl_len + total_shift)) < abs(L - tl_len)
+                    axis_report = ["Source: %d frames long. Target timeline: %d frames; with the %d frames thrown away inside files "
+                                   "put back: %d frames." % (L, tl_len, total_shift, tl_len + total_shift)]
+                if restore:
+                    axis_report.append("The target has cut footage out of its files that the source video still contains. "
+                                       "Those cuts are taken into account (%d frames), so the effects stay in sync with the picture "
+                                       "after them. Effects that lie in the removed footage are skipped." % total_shift)
+                elif axis_report:
+                    axis_report.append("The source video fits the target timeline as it is - the cuts inside files are used as they are.")
+
+        plan, matched, kept, hit = [], set(), 0, set()
+        per_file, n_clips = {}, 0
+        for e in self.list_entries(video_only=True):
+            if e.raw_path is None:
+                continue
+            n_clips += 1
+            if mode == "time" and track is not None and e.track.id != track:
+                continue
+            full, base = self._media_keys(e)
+            overlaps = []                                         # (first, last, effects, shift) in this clip's media time
+            if mode == "time":
+                key = None
+                origin = (file_offsets[full] if restore else e.pos - e.in_f) if timed else 0   # where media frame 0 of this clip sits
+                for skey, blocks in ann.items():                  # the effects of EVERY source video (all tracks)
+                    if skey in ident:
+                        if ident[skey] != full:
+                            continue                              # the same file: media time is simply the same
+                        base_t, org = 0, 0
+                    else:
+                        base_t, org = offset + axis_src.get(skey, 0), origin
+                    for i, (a, b, flts, name) in enumerate(blocks):
+                        lo, hi = max(base_t + a - org, e.in_f), min(base_t + b - org, e.out_f)
+                        if lo <= hi:                              # the part of the effect that lies on this clip
+                            overlaps.append((lo, hi, flts, base_t - org))
+                            hit.add((skey, i))
+            else:
+                if dst_media is not None and src_media is not None:
+                    if full != dst_media:
+                        continue
+                    key = src_media
+                else:
+                    key = full if full in ann else (next(iter(bases[base])) if len(bases.get(base, ())) == 1 else None)
+                if key is None or key not in ann:
+                    continue
+                for i, (a, b, flts, name) in enumerate(ann[key]):
+                    lo, hi = max(a + offset, e.in_f), min(b + offset, e.out_f)
+                    if lo <= hi:
+                        overlaps.append((lo, hi, flts, offset))
+                        hit.add((key, i))
+            if not overlaps:
+                continue
+            matched.add(key)
+            if existing == "keep" and self._tracker_filters(e.el):
+                kept += 1
+                continue
+            cuts = {e.in_f, e.out_f + 1}
+            for lo, hi, _, _ in overlaps:
+                cuts.update((lo, hi + 1))
+            pts = sorted(cuts)
+            pieces = []                                           # (first, last, indices of the effects active there)
+            for p, q in zip(pts, pts[1:]):
+                cov = frozenset(i for i, (lo, hi, _, _) in enumerate(overlaps) if lo <= p and q - 1 <= hi)
+                if pieces and pieces[-1][2] == cov:
+                    pieces[-1] = (pieces[-1][0], q - 1, cov)       # neighbours with the same effects stay one piece
+                else:
+                    pieces.append((p, q - 1, cov))
+            foreign = [f for f in e.el.findall("filter") if f not in self._tracker_filters(e.el)]
+            n_f = sum(len(overlaps[i][2]) for _, _, cov in pieces for i in cov)
+            plan.append({"entry": e, "overlaps": overlaps, "pieces": pieces, "whole": bool(foreign)})
+            st = per_file.setdefault(os.path.basename(e.raw_path.replace("\\", "/")), [0, 0, 0])
+            st[0] += 1
+            st[1] += len(pieces) if not foreign else 0
+            st[2] += n_f if not foreign else sum(len(f) for _, _, f, _ in overlaps)
+
+        n_blocks = sum(len(v) for v in ann.values())
+        names = ", ".join(sorted({r[3] for v in ann.values() for r in v})) or "-"
+        report = ["Source project: %d effect(s) on %d video part(s) of: %s." % (n_src_filters, n_blocks, names),
+                  "Target project: %d video clip(s)." % n_clips]
+        if mode == "time":
+            if len(ann) > 1:
+                report.append("Mode: by time - the source has %d videos (tracks); each one is placed on the target timeline like in "
+                              "the source project%s; %s." % (len(ann), " + " + format_clock(offset / self.fps + 0.05) if offset else "",
+                                                             "onto all video tracks" if track is None else "onto track %d only" % track))
+            else:
+                report.append("Mode: by time - the source video's time 0 sits at %s on the target timeline; %s." % (
+                    format_clock(offset / self.fps + 0.05), "all video tracks" if track is None else "track %d only" % track))
+            if ident:
+                report.append("Same files: %d of %d source video(s) are also used in the target; their effects are copied exactly by "
+                              "file (cuts and positions do not matter)%s." % (len(ident), len(ann), "; the others are placed by the timeline" if timed else ""))
+        elif dst_media is not None:
+            report.append("Mode: file pairing - the chosen source video goes onto the chosen target video (target time = source time %s)." % (
+                "%+.2f s" % (offset / self.fps) if offset else "unchanged"))
+        else:
+            report.append("Mode: file pairing - source and target videos are matched by path or file name.")
+        report += axis_report
+        report.append("")
+        if per_file:
+            report.append("Clips in the target that receive effects:")
+            for name, (clips, pieces, flts) in sorted(per_file.items()):
+                report.append("  %s: %d clip(s) (%d piece(s), %d effect copies)" % (name, clips, pieces, flts))
+        else:
+            report.append("No clip of the target receives effects" + (" - nothing of the target lies at that time." if mode == "time"
+                          else " - no matching video file; choose the target video yourself or switch to mode 'by time'."))
+        dropped = [(key, i) for key, v in ann.items() for i in range(len(v)) if (key, i) not in hit]
+        if dropped and per_file:
+            first = min(ann[k][i][0] for k, i in dropped)
+            report += ["", "%d of %d effect part(s) found no place in the target (it is shorter or has nothing there); "
+                           "the first one is at %s of the source video. They are skipped." % (len(dropped), n_blocks, format_clock(first / self.fps + 0.05))]
+        lost = sorted({ann[k][0][3] for k in ann if k not in matched}) if mode == "pair" and dst_media is None else []
+        if lost:
+            report += ["", "No matching video in the target for (their effects are NOT copied):"] + ["  " + n for n in lost]
+        if kept:
+            report += ["", "%d target clip(s) already have blur effects and are left untouched (see option 'existing')." % kept]
+        if any(item["whole"] for item in plan):
+            report += ["", "Clips that carry other effects are not cut: only blur effects are added on top of them."]
+        return plan, report
+
+    def _shift_results(self, flt, shift):
+        """Moves all keyframes of a tracker effect by 'shift' frames (the target clip has another time offset)."""
+        if not shift:
+            return
+        prop = next((p for p in flt.findall("property") if p.get("name") == "results"), None)
+        if prop is None or not prop.text:
+            return
+        items = {}
+        for kf in prop.text.split(";"):
+            if kf:
+                tc, op, rest = re.split(r"([$&|~\-]?=)", kf, maxsplit=1)
+                f = max(0, self.parse_time(tc) + shift)
+                items[f] = "%s%s%s" % (self.frame_to_tc(f), op, rest)
+        prop.text = ";".join(items[f] for f in sorted(items))
+
+    def _pad_hidden(self, flt, lo, hi):
+        """For a tracker effect that covers a whole clip (first..last frame = lo..hi): make sure it is hidden from the start of
+        the clip to its first box and from its last box to the end of the clip."""
+        prop = next((p for p in flt.findall("property") if p.get("name") == "results"), None)
+        if prop is None or not prop.text:
+            return
+        items = {}
+        for kf in prop.text.split(";"):
+            if kf:
+                tc, rest = re.split(r"[$&|~\-]?=", kf, maxsplit=1)
+                items[self.parse_time(tc)] = (kf, rest.strip() != "0 0 0 0")
+        visible = [f for f, (_, vis) in items.items() if vis]
+        if not visible:
+            return
+        first, last = min(visible), max(visible)
+        extra = []
+        if first > lo:
+            extra += [lo, first - 1]
+        if last < hi:
+            extra.append(last + 1)
+        for f in extra:
+            items.setdefault(f, ("%s&=0 0 0 0" % self.frame_to_tc(f), False))
+        prop.text = ";".join(items[f][0] for f in sorted(items))
+
+    def apply_merge(self, plan, existing="keep"):
+        """Carries out a plan from plan_merge(). Returns a stats dict; call save() afterwards."""
+        self._fid = self._max_filter_id()
+        stats = dict(clips=0, pieces=0, filters=0, whole_clip_mode=0, audio_split=0, groups_rewritten=0)
+        index = {(e.track.id, e.pos): e for e in self.list_entries()}
+        splits = []
+
+        def copy_of(f):
+            c = copy.deepcopy(f)
+            self._fid += 1
+            c.set("id", "filter%d" % self._fid)
+            return c
+
+        for item in plan:
+            e, overlaps, pieces = item["entry"], item["overlaps"], item["pieces"]
+            stats["clips"] += 1
+            if item["whole"]:
+                stats["whole_clip_mode"] += 1
+                if existing == "replace":
+                    for f in self._tracker_filters(e.el):
+                        e.el.remove(f)
+                for lo, hi, flts, shift in overlaps:
+                    for f in flts:
+                        if _prop(f, "mlt_service") == TRACKER_SERVICE:
+                            c = copy_of(f)
+                            self._shift_results(c, shift)
+                            self._pad_hidden(c, e.in_f, e.out_f)       # hidden everywhere on the clip except where it was tracked
+                            e.el.append(c)
+                            stats["filters"] += 1
+                _set_prop(e.el, "kdenlive:activeeffect", "0")
+                continue
+            new_els = []
+            for i, (s, t, cov) in enumerate(pieces):
+                el = self._clone_piece(e.el, s, t, i == 0, i == len(pieces) - 1)
+                if cov:
+                    if existing == "replace":
+                        for f in self._tracker_filters(el):
+                            el.remove(f)
+                    _set_prop(el, "kdenlive:activeeffect", "0")
+                    for idx in sorted(cov):
+                        for f in overlaps[idx][2]:
+                            c = copy_of(f)
+                            self._shift_results(c, overlaps[idx][3])
+                            el.append(c)
+                            stats["filters"] += 1
+                new_els.append(el)
+            self._replace(e.playlist, e.el, new_els)
+            stats["pieces"] += len(pieces)
+            splits.append((e, [(s, t, bool(cov)) for s, t, cov in pieces]))
+        if splits:
+            self._split_audio_and_groups(splits, index, stats)
+        return stats
+
     def save(self, out_path):
         if os.path.abspath(out_path) == os.path.abspath(self.path):
             raise ProjectError("Refusing to overwrite the input project - choose a different output file.")
@@ -1122,6 +1495,14 @@ ka = types.SimpleNamespace(KdenliveProject=KdenliveProject, Options=Options, ext
                            parse_user_time=parse_user_time, format_clock=format_clock)
 # ======================================================================================
 
+MERGE_BY_TIME = "by timeline time"
+MERGE_PAIR = "pair video files (advanced)"
+MERGE_MODES = (MERGE_BY_TIME, MERGE_PAIR)             # the first one is the default
+MERGE_AUTO = "(match by file name)"
+MERGE_ALL_VIDEOS = "(all videos)"
+MERGE_ALL_TRACKS = "all video tracks"
+
+
 def compute_window_size(screen_w, screen_h, saved=None):
     """Window size that fits the screen -> (width, height, min_width, min_height).
     Leaves room for the title bar and the taskbar, so it also works on 1280x720 screens.
@@ -1189,6 +1570,19 @@ class BlurApp:
         self.thin_pct_var = tk.DoubleVar(value=4.0)   # keyframe thinning tolerance in % of the object size (0 = every frame)
         self.media_dir_var = tk.StringVar(value="")        # optional: where the project's source videos live
         self.existing_var = tk.StringVar(value="keep")     # timeline mode: clips that already have a tracker effect
+        self.merge_src_var = tk.StringVar(value="")        # merge tab: project that has the effects and cuts
+        self.merge_dst_var = tk.StringVar(value="")        # merge tab: project that receives them
+        self.merge_out_var = tk.StringVar(value="")
+        self.merge_scope_var = tk.StringVar(value="blur")  # "blur" = blur effects only, "all" = other simple effects too
+        self.merge_existing_var = tk.StringVar(value="keep")
+        self.merge_mode_var = tk.StringVar(value=MERGE_BY_TIME)       # map by timeline time (default) or pair two video files
+        self.merge_srcvid_var = tk.StringVar(value=MERGE_ALL_VIDEOS)  # which video of the source project to take the effects from
+        self.merge_dstvid_var = tk.StringVar(value=MERGE_AUTO)       # which video of the target receives them
+        self.merge_track_var = tk.StringVar(value=MERGE_ALL_TRACKS)  # which target track (time mode)
+        self.merge_offset_var = tk.StringVar(value="0")
+        self.merge_restore_var = tk.StringVar(value="auto")      # cuts inside target files: auto / undo / keep
+        self.merge_samefiles_var = tk.IntVar(value=1)            # copy exactly by file where the same video is in both projects
+        self._merge_src_map, self._merge_dst_map, self._merge_track_map = {}, {}, {}
         self.preview_sec_var = tk.StringVar(value="1.0")   # preview every N seconds of video, decimals allowed, 0 = off
         self.running = False
         self.cancel_event = threading.Event()
@@ -1255,6 +1649,9 @@ class BlurApp:
         
         notebook.add(tab_main, text=" Processing & Execution ")
         notebook.add(tab_config, text=" Advanced Configuration ")
+        tab_merge = ttk.Frame(notebook)
+        notebook.add(tab_merge, text=" Merge Effects ")
+        self.build_merge_tab(tab_merge)
 
         # ================= TAB 1: MAIN PROCESSING =================
         file_frame = tk.LabelFrame(tab_main, text=" Files ", font=("Arial", 10, "bold"), padx=10, pady=4)
@@ -1396,10 +1793,10 @@ class BlurApp:
         self.apply_mode_ui()
 
     def get_initial_dir(self, current_path):
-        """Helper to resolve the directory of the current path for file dialogs."""
-        if current_path and os.path.exists(current_path):
-            d = os.path.dirname(current_path)
-            if os.path.exists(d):
+        """Helper to resolve the directory of the current path for file dialogs (works for a file name that does not exist yet)."""
+        if current_path:
+            d = current_path if os.path.isdir(current_path) else os.path.dirname(current_path)
+            if d and os.path.isdir(d):
                 return d
         inp = self.input_path.get()
         if inp:
@@ -1465,6 +1862,244 @@ class BlurApp:
             self.media_dir_var.set(d)
             self.save_current_settings(silent=True)
 
+    # ---------------------------------------------------------------- "Merge Effects" tab
+    def build_merge_tab(self, tab):
+        tk.Label(tab, justify="left", anchor="w", wraplength=900, fg="gray",
+                 text="Copies the blur effects - and the cuts they need - from one Kdenlive project into another one. "
+                      "The effects belong to the TIME in the source video, so the target project may use completely "
+                      "different video files and tracks. Nothing is removed from the target, and neither project "
+                      "file is overwritten."
+                 ).pack(fill="x", padx=12, pady=(6, 2))
+
+        files = tk.LabelFrame(tab, text=" Projects ", font=("Arial", 10, "bold"), padx=10, pady=3)
+        files.pack(fill="x", padx=10, pady=2)
+        files.columnconfigure(1, weight=1)
+        rows = (("Source (has the effects):", self.merge_src_var, self.browse_merge_src, "Browse..."),
+                ("Target (receives them):", self.merge_dst_var, self.browse_merge_dst, "Browse..."),
+                ("Output:", self.merge_out_var, self.browse_merge_out, "Save As..."))
+        for r, (label, var, cmd, btn) in enumerate(rows):
+            tk.Label(files, text=label).grid(row=r, column=0, sticky="w", pady=1)
+            tk.Entry(files, textvariable=var, width=20).grid(row=r, column=1, sticky="ew", padx=5, pady=1)
+            tk.Button(files, text=btn, command=cmd).grid(row=r, column=2, pady=1)
+
+        opts = tk.LabelFrame(tab, text=" How to apply ", font=("Arial", 10, "bold"), padx=10, pady=3)
+        opts.pack(fill="x", padx=10, pady=2)
+        opts.columnconfigure(2, weight=1)
+
+        tk.Label(opts, text="Method:").grid(row=0, column=0, sticky="w", pady=1)
+        mode_combo = ttk.Combobox(opts, textvariable=self.merge_mode_var, values=list(MERGE_MODES), state="readonly", width=24)
+        mode_combo.grid(row=0, column=1, sticky="w", padx=5)
+        mode_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_merge_mode_ui())
+        self.merge_mode_hint = tk.Label(opts, text="", fg="gray", anchor="w", justify="left", wraplength=560)
+        self.merge_mode_hint.grid(row=0, column=2, sticky="w", padx=8)
+
+        tk.Label(opts, text="Source video:").grid(row=1, column=0, sticky="w", pady=1)
+        self.merge_srcvid_combo = ttk.Combobox(opts, textvariable=self.merge_srcvid_var, values=[], state="readonly", width=40)
+        self.merge_srcvid_combo.grid(row=1, column=1, columnspan=2, sticky="w", padx=5)
+
+        tk.Label(opts, text="Target video:").grid(row=2, column=0, sticky="w", pady=1)
+        self.merge_dstvid_combo = ttk.Combobox(opts, textvariable=self.merge_dstvid_var, values=[MERGE_AUTO], state="readonly", width=40)
+        self.merge_dstvid_combo.grid(row=2, column=1, columnspan=2, sticky="w", padx=5)
+
+        tk.Label(opts, text="Target track:").grid(row=3, column=0, sticky="w", pady=1)
+        self.merge_track_combo = ttk.Combobox(opts, textvariable=self.merge_track_var, values=[MERGE_ALL_TRACKS], state="readonly", width=40)
+        self.merge_track_combo.grid(row=3, column=1, columnspan=2, sticky="w", padx=5)
+
+        self.merge_offset_label = tk.Label(opts, text="Offset:")
+        self.merge_offset_label.grid(row=4, column=0, sticky="w", pady=1)
+        tk.Entry(opts, textvariable=self.merge_offset_var, width=12).grid(row=4, column=1, sticky="w", padx=5)
+        self.merge_offset_hint = tk.Label(opts, text="", fg="gray", anchor="w", justify="left", wraplength=560)
+        self.merge_offset_hint.grid(row=4, column=2, sticky="w", padx=8)
+
+        tk.Label(opts, text="Cuts in target files:").grid(row=5, column=0, sticky="w", pady=1)
+        self.merge_restore_combo = ttk.Combobox(opts, textvariable=self.merge_restore_var, values=["auto", "undo", "keep"], state="readonly", width=8)
+        self.merge_restore_combo.grid(row=5, column=1, sticky="w", padx=5)
+        tk.Label(opts, text="undo = the source video was rendered BEFORE footage was cut out of the target's files; "
+                            "auto compares the video's length with the target", fg="gray", anchor="w", justify="left", wraplength=560
+                 ).grid(row=5, column=2, sticky="w", padx=8)
+
+        self.merge_samefiles_check = tk.Checkbutton(
+            opts, variable=self.merge_samefiles_var, anchor="w", justify="left",
+            text="Copy exactly by file where the same video file is in both projects (recommended)")
+        self.merge_samefiles_check.grid(row=6, column=0, columnspan=3, sticky="w", pady=1)
+
+        tk.Label(opts, text="Copy:").grid(row=7, column=0, sticky="w", pady=1)
+        scope = ttk.Combobox(opts, textvariable=self.merge_scope_var, values=["blur", "all"], state="readonly", width=8)
+        scope.grid(row=7, column=1, sticky="w", padx=5)
+        scope.bind("<<ComboboxSelected>>", lambda e: self.refresh_merge_info())
+        tk.Label(opts, text="blur = blur effects only, all = other simple effects (colour, ...) as well", fg="gray").grid(row=7, column=2, sticky="w", padx=8)
+        tk.Label(opts, text="Blur already in target:").grid(row=8, column=0, sticky="w", pady=1)
+        ttk.Combobox(opts, textvariable=self.merge_existing_var, values=["keep", "replace"], state="readonly", width=8).grid(row=8, column=1, sticky="w", padx=5)
+        tk.Label(opts, text="keep = such clips stay as they are, replace = overwritten where effects are copied", fg="gray").grid(row=8, column=2, sticky="w", padx=8)
+
+        btns = tk.Frame(tab)
+        btns.pack(fill="x", padx=10, pady=4)
+        tk.Button(btns, text="Preview", command=lambda: self.run_merge(True), width=14).pack(side="left")
+        tk.Button(btns, text="Merge && Save", bg="#4CAF50", fg="white", font=("Arial", 10, "bold"),
+                  command=lambda: self.run_merge(False)).pack(side="left", padx=8, fill="x", expand=True)
+
+        log = tk.Frame(tab)
+        log.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        self.merge_text = tk.Text(log, height=4, wrap="word", state="disabled")
+        bar = ttk.Scrollbar(log, orient="vertical", command=self.merge_text.yview)
+        self.merge_text.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        self.merge_text.pack(side="left", fill="both", expand=True)
+        self.apply_merge_mode_ui()
+        self.refresh_merge_info()                    # remembered projects from the last session fill the drop-downs again
+
+    def apply_merge_mode_ui(self):
+        """Enable only the fields that matter for the chosen method and explain them."""
+        by_time = self.merge_mode_var.get() == MERGE_BY_TIME
+        self.merge_dstvid_combo.config(state="disabled" if by_time else "readonly")
+        self.merge_track_combo.config(state="readonly" if by_time else "disabled")
+        self.merge_restore_combo.config(state="readonly" if by_time else "disabled")
+        self.merge_samefiles_check.config(state="normal" if by_time else "disabled")
+        if by_time:
+            self.merge_mode_hint.config(text="The effects of ALL videos/tracks of the source are placed on the target's timeline "
+                                             "and go onto whatever clips are there. Stops where the target has no clips any more.")
+            self.merge_offset_label.config(text="Starts at:")
+            self.merge_offset_hint.config(text="position on the target timeline where time 0 of the source video sits (HH:MM:SS)")
+        else:
+            self.merge_mode_hint.config(text="One source video is paired with a video file of the target (automatically by name, or "
+                                             "chosen by hand). Stops where the target video ends.")
+            self.merge_offset_label.config(text="Offset:")
+            self.merge_offset_hint.config(text="target video time = source video time + offset (HH:MM:SS or seconds, may be negative, e.g. -12.5)")
+
+    def refresh_merge_info(self):
+        """Fills the drop-downs from the two chosen projects."""
+        try:
+            src, dst = self.merge_src_var.get(), self.merge_dst_var.get()
+            if src and os.path.exists(src):
+                media = KdenliveProject(src).media_with_effects(self.merge_scope_var.get())
+                self._merge_src_map = {MERGE_ALL_VIDEOS: None}
+                self._merge_src_map.update({"%s  (%d effects)" % (m[1], m[2]): m[0] for m in media})
+                self.merge_srcvid_combo.config(values=list(self._merge_src_map))
+                if self.merge_srcvid_var.get() not in self._merge_src_map:
+                    self.merge_srcvid_var.set(MERGE_ALL_VIDEOS)
+            if dst and os.path.exists(dst):
+                target = KdenliveProject(dst)
+                self._merge_dst_map = {"%s  (%d clips)" % (n, c): k for k, n, c in target.video_media()}
+                self.merge_dstvid_combo.config(values=[MERGE_AUTO] + list(self._merge_dst_map))
+                if self.merge_dstvid_var.get() not in [MERGE_AUTO] + list(self._merge_dst_map):
+                    self.merge_dstvid_var.set(MERGE_AUTO)
+                self._merge_track_map = {"track %d  (%d clips)" % (tid, n): tid for tid, n in target.video_tracks()}
+                self.merge_track_combo.config(values=[MERGE_ALL_TRACKS] + list(self._merge_track_map))
+                if self.merge_track_var.get() not in [MERGE_ALL_TRACKS] + list(self._merge_track_map):
+                    self.merge_track_var.set(MERGE_ALL_TRACKS)
+        except Exception as e:
+            self.merge_show("Could not read a project: %s" % e)
+
+    def merge_show(self, text):
+        self.merge_text.config(state="normal")
+        self.merge_text.delete("1.0", "end")
+        self.merge_text.insert("end", text)
+        self.merge_text.config(state="disabled")
+
+    def _suggest_merge_output(self):
+        dst = self.merge_dst_var.get()
+        if not dst:
+            return
+        base, _ = os.path.splitext(dst)
+        m = re.search(r"_merged(\d*)$", base)
+        base = base[:m.start()] + "_merged" + str(int(m.group(1) or 1) + 1) if m else base + "_merged"
+        self.merge_out_var.set(base + ".kdenlive")
+
+    def browse_merge_src(self):
+        f = filedialog.askopenfilename(title="Project with the effects and cuts", initialdir=self.get_initial_dir(self.merge_src_var.get() or self.merge_dst_var.get() or self.merge_out_var.get()),
+                                       filetypes=[("Kdenlive Project", "*.kdenlive"), ("All Files", "*.*")])
+        if f:
+            self.merge_src_var.set(f)
+            self.refresh_merge_info()
+            self.save_current_settings(silent=True)
+
+    def browse_merge_dst(self):
+        f = filedialog.askopenfilename(title="Project that should receive the effects", initialdir=self.get_initial_dir(self.merge_dst_var.get() or self.merge_src_var.get() or self.merge_out_var.get()),
+                                       filetypes=[("Kdenlive Project", "*.kdenlive"), ("All Files", "*.*")])
+        if f:
+            self.merge_dst_var.set(f)
+            self._suggest_merge_output()
+            self.refresh_merge_info()
+            self.save_current_settings(silent=True)
+
+    def browse_merge_out(self):
+        f = filedialog.asksaveasfilename(title="Save merged project as", initialdir=self.get_initial_dir(self.merge_out_var.get() or self.merge_dst_var.get() or self.merge_src_var.get()),
+                                         defaultextension=".kdenlive", filetypes=[("Kdenlive Project", "*.kdenlive")])
+        if f:
+            self.merge_out_var.set(f)
+            self.save_current_settings(silent=True)
+
+    @staticmethod
+    def _parse_offset(text, fps):
+        """'0', '00:23:41', '12.5' or '-12.5' (seconds) -> frames at 'fps'."""
+        t = (text or "").strip().replace(",", ".")
+        negative = t.startswith("-")
+        t = t.lstrip("+-").strip()
+        if not t:
+            return 0
+        frames = parse_user_time(t, fps)
+        if frames is None:
+            raise ValueError("Cannot read the offset '%s'. Use HH:MM:SS or seconds, e.g. 00:23:41 or -12.5." % text)
+        return -frames if negative else frames
+
+    def run_merge(self, dry_run):
+        try:
+            src, dst, out = self.merge_src_var.get(), self.merge_dst_var.get(), self.merge_out_var.get()
+            if not src or not dst:
+                messagebox.showerror("Error", "Please choose the source project and the target project.")
+                return
+            if os.path.abspath(src) == os.path.abspath(dst):
+                messagebox.showerror("Error", "Source and target are the same file.")
+                return
+            if not dry_run:
+                if not out:
+                    messagebox.showerror("Error", "Please choose where to save the merged project.")
+                    return
+                if os.path.abspath(out) in (os.path.abspath(src), os.path.abspath(dst)):
+                    messagebox.showerror("Error", "The output must be a new file, not one of the two projects.")
+                    return
+                if os.path.exists(out) and not messagebox.askyesno("Overwrite?", f"{os.path.basename(out)} already exists.\nOverwrite it?"):
+                    return
+            self.merge_show("Reading projects ...")
+            self.root.update_idletasks()
+            self.refresh_merge_info()
+            target, source = KdenliveProject(dst), KdenliveProject(src)
+            by_time = self.merge_mode_var.get() == MERGE_BY_TIME
+            src_key = self._merge_src_map.get(self.merge_srcvid_var.get())          # None = all videos of the source
+            dst_key = None if by_time else self._merge_dst_map.get(self.merge_dstvid_var.get())
+            if not by_time and dst_key is not None and src_key is None:
+                # pairing by hand needs ONE source video: take the one with the most effects
+                src_key = next((v for v in self._merge_src_map.values() if v is not None), None)
+            offset = self._parse_offset(self.merge_offset_var.get(), target.fps)
+            existing = self.merge_existing_var.get()
+            plan, report = target.plan_merge(
+                source, self.merge_scope_var.get(), existing, mode="time" if by_time else "pair", src_media=src_key,
+                dst_media=dst_key,
+                offset=offset, track=self._merge_track_map.get(self.merge_track_var.get()) if by_time else None,
+                restore_cuts={"undo": "yes", "keep": "no"}.get(self.merge_restore_var.get(), "auto"),
+                same_files=bool(self.merge_samefiles_var.get()))
+            text = "\n".join(report)
+            if dry_run:
+                text += "\n\nThis was only a preview - nothing has been written."
+            elif not plan:
+                text += "\n\nNothing to merge - nothing was written."
+            else:
+                stats = target.apply_merge(plan, existing)
+                target.save(out)
+                text += ("\n\nDone. %d clip(s) changed, %d effect copies added, %d audio clip(s) cut to match.\nSaved to: %s"
+                         % (stats["clips"], stats["filters"], stats["audio_split"], out))
+                if target.warnings:
+                    text += "\n\nWarnings:\n" + "\n".join(sorted(set(target.warnings))[:8])
+            self.merge_show(text)
+            self.save_current_settings(silent=True)              # remember the files and options for next time
+        except ValueError as e:
+            self.merge_show("")
+            messagebox.showerror("Error", str(e))
+        except Exception as e:
+            traceback.print_exc()
+            self.merge_show("")
+            messagebox.showerror("Error", describe_error(e))
+
     def browse_output(self):
         initial = self.get_initial_dir(self.output_path.get())
         ext = ".mkv" if self.export_mode_var.get() == "mkv" else ".kdenlive"
@@ -1502,7 +2137,16 @@ class BlurApp:
             "veh_min_area": self.veh_min_area_var.get(),
             "input_path": self.input_path.get(),
             "output_path": self.output_path.get(),
-            "window_size": self.current_window_size()
+            "window_size": self.current_window_size(),
+            "merge_src": self.merge_src_var.get(),
+            "merge_dst": self.merge_dst_var.get(),
+            "merge_out": self.merge_out_var.get(),
+            "merge_mode": self.merge_mode_var.get(),
+            "merge_scope": self.merge_scope_var.get(),
+            "merge_existing": self.merge_existing_var.get(),
+            "merge_restore": self.merge_restore_var.get(),
+            "merge_samefiles": self.merge_samefiles_var.get(),
+            "merge_offset": self.merge_offset_var.get()
         }
 
     def apply_settings_dict(self, d):
@@ -1527,6 +2171,16 @@ class BlurApp:
         if "veh_min_area" in d: self.veh_min_area_var.set(d["veh_min_area"])
         if "input_path" in d: self.input_path.set(d["input_path"])
         if "output_path" in d: self.output_path.set(d["output_path"])
+        for key, var in (("merge_src", self.merge_src_var), ("merge_dst", self.merge_dst_var), ("merge_out", self.merge_out_var),
+                         ("merge_scope", self.merge_scope_var), ("merge_existing", self.merge_existing_var),
+                         ("merge_restore", self.merge_restore_var), ("merge_offset", self.merge_offset_var),
+                         ("merge_samefiles", self.merge_samefiles_var)):
+            if key in d:
+                var.set(d[key])
+        if d.get("merge_mode") in MERGE_MODES:
+            self.merge_mode_var.set(d["merge_mode"])
+        elif str(d.get("merge_mode", "")).startswith("pair"):        # name used by an earlier version
+            self.merge_mode_var.set(MERGE_PAIR)
         ws = d.get("window_size")
         if isinstance(ws, (list, tuple)) and len(ws) == 2:
             self.saved_window_size = (ws[0], ws[1])      # used at the next start only

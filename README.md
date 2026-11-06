@@ -1,6 +1,6 @@
 # Kdenlive Auto-Blur Tool
 
-<img src="kdenlive-blur-gui.png" width="96" align="right" alt="icon">
+<img src="autoblur-gui.png" width="96" align="right" alt="icon">
 
 Detects, tracks and blurs **people and vehicles** in your footage – and puts the result straight
 into your **Kdenlive project** as normal, editable tracking effects.
@@ -29,6 +29,8 @@ follows them. Open the copy in Kdenlive, check it, fix what you want by hand, re
   movement is reduced to a few keyframes (adjustable under *Keyframe Thinning*), which makes manual fixes easy.
 * **Existing effects are respected.** Clips that already have a tracker effect are left alone
   (or redone, your choice), so your manual work is safe.
+* **Merge effects between projects.** Copy the blur effects (and the cuts they need) from an earlier project -
+  for example a one-clip project - into a bigger edit that uses the same video files.
 * **Live preview** with boxes, track IDs, timeline position, progress and time remaining.
 * **Check video mode.** Alternatively, render a quick `.mkv` with the blur burned in (with the
   original audio) straight from a video file – handy for testing the detection settings.
@@ -156,6 +158,47 @@ again whenever you like.
 `keep` (default) leaves clips that already have a tracker effect completely untouched,
 `replace` removes the old tracker effects of clips in the processed range and creates new ones.
 
+### Merge effects from another project
+The **Merge Effects** tab copies blur effects - and the cuts they need - from a *source* project into a *target*
+project. The effects belong to the **time in the source video**, so the target may use completely different video
+files and tracks. Typical use: you anonymised one video in a small project and now want the same blur in the big
+project that contains all your original clips.
+
+1. Choose the **source** (has the effects) and the **target** (receives them). An output name
+   `<target>_merged.kdenlive` is suggested. **Preview** shows what would happen without writing anything.
+2. Choose the **method** (the default is *by timeline time*):
+   * **by timeline time** (default) - time 0 of the source video is placed at the position *Starts at* on the target's
+     timeline (default 00:00:00), and the effects go onto whatever clips lie there - on all video tracks or only
+     the chosen *Target track*. **All videos and tracks of the source are copied** (*Source video*: `(all videos)`,
+     the default): a source with a single video, e.g. a rendered edit, uses that video's own time; a source with
+     several videos or tracks places each video where the source project has it. Pick one video in the list to
+     copy only its effects. The keyframes are re-timed for every clip. The effects stop where the target has no
+     clips any more; if the target is shorter than the source, the rest is skipped and reported.
+   * **Cuts in target files** (only with *by timeline time*): if you rendered the source video from the target
+     project and *later* cut footage out of the middle of one of its files, the video still contains that footage and
+     runs ahead of the timeline from the cut on. `auto` (default) compares the video's length with the target's
+     timeline and puts such cuts back for the mapping if that fits better; `undo` / `keep` force it either way.
+     The preview shows the lengths it compared. Effects that lie in the removed footage are skipped.
+   * **Same files** (only with *by timeline time*, on by default): if a video of the source is *also used in the
+     target* (same path or same unique file name), its effects are copied exactly by file - they land on the same
+     frames of that file, no matter how the two projects are cut or positioned. Only source videos that do not exist
+     in the target (for example a rendered video of the whole edit) are placed by the timeline. The preview tells how
+     many videos were matched. Untick the box to force the pure timeline method. A *Starts at* value other than
+     00:00:00 also switches it off.
+   * **pair video files (advanced)** - only for the special case that the source video is a copy of *one specific
+     file* of the target (for example a re-encoded version of one chapter). It is paired with one video file of the
+     target: automatically if the path or file name matches, or choose the *Target video* by hand. Target time =
+     source time + *Offset* (default 0). The effects stop where the target video ends.
+   For a rendered video of the whole edit, use the default.
+3. **Merge & Save** cuts the target's clips where the effects start and end, adds the effects and cuts the grouped
+   audio clips to match. Where only a part of a clip is covered, only that part gets effects.
+
+The tab remembers your files, folders and options for the next start. Nothing is removed from the target, and neither project file is overwritten. *Blur already in target* controls clips
+that already have blur effects (`keep` = they stay as they are, `replace` = overwritten where effects are copied);
+*Copy* `blur` only copies blur effects, `all` also copies other simple effects. A clip in the target that carries
+other effects is not cut; the blur effects are added on top of it. Only effects are copied - the tool never deletes
+content from the target, so cuts that merely remove parts of the video are not transferred.
+
 ### Check video (`mkv` mode)
 Select **Mode** `mkv` and a normal video file. The tool renders a standalone `.mkv` with the blur burned in
 and the original audio (needs `ffmpeg`). The time range fields then refer to the video's own time.
@@ -208,9 +251,11 @@ Windows *Apps & features*), then delete the two folders above if you want to get
 
 ## Building the packages
 
+Run these from a clone of the repository (the `LICENSE` file in the repository root is included in the packages).
+
 ```bash
 # Debian / Ubuntu  (needs dpkg-deb)
-MAINTAINER="Dietmar Schnabel <dietmar.schnabel<at>gmail.com>" HOMEPAGE="https://github.com/dietmarschnabel-code/kdenlive-blur-gui" ./packaging/linux/build-deb.sh
+./packaging/linux/build-deb.sh
 #   -> dist/kdenlive-blur-gui_<version>_all.deb
 
 # Fedora  (sudo dnf install rpm-build desktop-file-utils)
@@ -226,10 +271,10 @@ The version number is `__version__` in `kdenlive_blur_gui.py`; keep the `Version
 
 ## License
 
-The Kdenlive Auto-Blur Tool is free software, licensed under the **GNU Affero General Public License,
-version 3 or later** (see `LICENSE`).
+The Kdenlive Auto-Blur Tool is free software, licensed under the **GNU Affero General Public License, version 3 or
+later** (AGPL-3.0-or-later, see `LICENSE`).
 
-It uses these components, which are installed separately and keep their own licenses:
+It uses these components, which are installed separately and keep their own licenses (Ultralytics YOLO is AGPL-3.0 as well):
 [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) (AGPL-3.0, also for the model files it downloads),
 [OpenCV](https://opencv.org) (Apache-2.0), [PyTorch](https://pytorch.org) (BSD-3-Clause),
 [Pillow](https://python-pillow.org) (HPND), [OpenVINO](https://github.com/openvinotoolkit/openvino) (Apache-2.0).
@@ -240,3 +285,8 @@ affiliated with or endorsed by the Kdenlive team or KDE.
 
 Parts of this program were written with the help of AI assistants and tested by the author on real footage.
 Bug reports and pull requests are welcome.
+
+## Author and contact
+
+Copyright (C) 2026 **Dietmar Schnabel** - e-mail: `dietmar.schnabel<at>gmail.com` (write it with @ instead of `<at>`).
+Bug reports and ideas are welcome as GitHub issues.
