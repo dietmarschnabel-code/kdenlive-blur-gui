@@ -1,5 +1,5 @@
 Name:           kdenlive-blur-gui
-Version:        1.0.1
+Version:        1.0.2
 Release:        1%{?dist}
 Summary:        Detect, track and blur people and vehicles in Kdenlive projects
 License:        AGPL-3.0-or-later
