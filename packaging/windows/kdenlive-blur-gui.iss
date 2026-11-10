@@ -3,7 +3,7 @@
 ;         or run   ISCC.exe packaging\windows\kdenlive-blur-gui.iss
 ; Needs a LICENSE file in the repository root.
 #define MyAppName "Kdenlive Auto-Blur Tool"
-#define MyAppVersion "1.0.1"
+#define MyAppVersion "1.0.2"
 #define MyAppPublisher "Kdenlive Auto-Blur Tool contributors"
 #define MyAppURL "https://github.com/YOUR-USER/kdenlive-blur-gui"
 

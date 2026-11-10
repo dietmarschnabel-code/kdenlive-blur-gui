@@ -18,7 +18,7 @@ Run:            python3 kdenlive_blur_gui.py
 Dry run:        python3 kdenlive_blur_gui.py project.kdenlive [media_folder] [start] [end]
 Repair/install: python3 kdenlive_blur_gui.py --install-deps
 """
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 APP_NAME = "Kdenlive Auto-Blur Tool"
 
 import os
@@ -1321,10 +1321,11 @@ def _link_cost(ca, cb, gap):
     return d + 0.1 * abs(math.log(area_ratio)) + 0.01 * g
 
 
-def consolidate_tracks(track_history, max_gap=20, max_overlap=3):
+def consolidate_tracks(track_history, max_gap=20, max_overlap=3, conf=None):
     """Joins fragments that belong to ONE object (the tracker often starts a new ID after a missed frame or a
     fast movement) and fills small holes by interpolation, so the blur never drops out for a moment.
     Works in place. Only tracks of the same kind (person/vehicle) from the same scan range are joined.
+    'conf' (optional) maps a track key to [best confidence, number of detections]; it is combined along with the tracks.
     Returns the number of joins."""
     if max_gap <= 0:
         return 0
@@ -1377,6 +1378,10 @@ def consolidate_tracks(track_history, max_gap=20, max_overlap=3):
             joins += 1
             merged.extend(nxt)
             del track_history[k]
+            if conf is not None and k in conf:
+                best, n = conf.pop(k)
+                head_best, head_n = conf.get(head, (0.0, 0))
+                conf[head] = [max(best, head_best), n + head_n]
         track_history[head] = merged
     # fill small holes inside every track as well (frames the detector missed for a moment)
     for key, coords in track_history.items():
@@ -1405,6 +1410,22 @@ def _smooth_at(kfs, f):
         m2 = (p2[c] - p1[c]) if p3 is p2 else (p3[c] - p1[c]) * span / (p3[0] - p1[0])
         out.append((2 * t3 - 3 * t2 + 1) * p1[c] + (t3 - 2 * t2 + t) * m1 + (-2 * t3 + 3 * t2) * p2[c] + (t3 - t2) * m2)
     return out
+
+
+def confirm_tracks(track_history, track_conf, min_best=0.0, min_len=0):
+    """Removes tracks that were never seen clearly (best confidence below 'min_best') or only on very few frames
+    (fewer than 'min_len') - typical for shadows and reflections, which flicker and score lower than real people.
+    track_conf maps a key to [best confidence, number of detections]. Returns the number of removed tracks."""
+    if min_best <= 0 and min_len <= 0:
+        return 0
+    removed = 0
+    for key in list(track_history):
+        best, n = track_conf.get(key, (1.0, len(track_history[key])))
+        if best < min_best or n < min_len:
+            del track_history[key]
+            track_conf.pop(key, None)
+            removed += 1
+    return removed
 
 
 def thin_keyframes(coords, pct, max_span=60):
@@ -1491,7 +1512,7 @@ def plan_cli(argv):
 
 
 ka = types.SimpleNamespace(KdenliveProject=KdenliveProject, Options=Options, extend_tails=extend_tails,
-                           consolidate_tracks=consolidate_tracks, thin_keyframes=thin_keyframes,
+                           consolidate_tracks=consolidate_tracks, thin_keyframes=thin_keyframes, confirm_tracks=confirm_tracks,
                            parse_user_time=parse_user_time, format_clock=format_clock)
 # ======================================================================================
 
@@ -1568,6 +1589,12 @@ class BlurApp:
         self.tail_buffer_var = tk.IntVar(value=3)
         self.join_gap_var = tk.IntVar(value=20)       # join fragments of one object if the gap is at most this many frames (0 = off)
         self.thin_pct_var = tk.DoubleVar(value=4.0)   # keyframe thinning tolerance in % of the object size (0 = every frame)
+        # false-alarm filters (shadows etc.); 0 = off, so the default behaviour is unchanged
+        self.person_conf_var = tk.DoubleVar(value=0.0)    # extra minimum confidence for persons
+        self.confirm_conf_var = tk.DoubleVar(value=0.0)   # a track is kept only if its best detection reaches this
+        self.min_track_len_var = tk.IntVar(value=0)       # ... and was seen on at least this many frames
+        self.person_ratio_var = tk.DoubleVar(value=0.0)   # persons: minimum height/width ratio (flat shapes are shadows)
+        self.fp_preset_var = tk.StringVar(value="custom")
         self.media_dir_var = tk.StringVar(value="")        # optional: where the project's source videos live
         self.existing_var = tk.StringVar(value="keep")     # timeline mode: clips that already have a tracker effect
         self.merge_src_var = tk.StringVar(value="")        # merge tab: project that has the effects and cuts
@@ -1733,7 +1760,7 @@ class BlurApp:
         inf_frame.pack(fill="x", pady=5)
 
         tk.Label(inf_frame, text="YOLO Model Version:").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Combobox(inf_frame, textvariable=self.model_var, values=["yolo26s.pt", "yolo26n.pt", "yolo11s.pt", "yolo11n.pt"], state="readonly", width=18).grid(row=0, column=1, sticky="w", padx=10, pady=4)
+        ttk.Combobox(inf_frame, textvariable=self.model_var, values=["yolo26s.pt", "yolo26n.pt", "yolo26m.pt", "yolo26x.pt", "yolo11s.pt", "yolo11n.pt", "yolo11m.pt", "yolo11x.pt"], state="readonly", width=18).grid(row=0, column=1, sticky="w", padx=10, pady=4)
 
         tk.Label(inf_frame, text="Execution Device (Hardware):").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Combobox(inf_frame, textvariable=self.device_var, values=["intel:gpu", "intel:cpu", "intel:npu", "cuda:0", "cpu"], state="readonly", width=18).grid(row=1, column=1, sticky="w", padx=10, pady=4)
@@ -1782,6 +1809,26 @@ class BlurApp:
 
         tk.Label(size_frame, text="Cars / Trucks / Buses Min Area (px²):").grid(row=3, column=0, sticky="w", pady=4)
         tk.Spinbox(size_frame, from_=1000, to=15000, increment=500, textvariable=self.veh_min_area_var, width=15).grid(row=3, column=1, sticky="w", padx=10, pady=4)
+
+        fp_frame = tk.LabelFrame(cfg_inner, text=" False-Alarm Filters (shadows, reflections) ", font=("Arial", 10, "bold"), padx=10, pady=10)
+        fp_frame.pack(fill="x", pady=10)
+        tk.Label(fp_frame, text="Preset:").grid(row=0, column=0, sticky="w", pady=4)
+        preset = ttk.Combobox(fp_frame, textvariable=self.fp_preset_var, values=["custom", "off", "moderate", "strong"], state="readonly", width=15)
+        preset.grid(row=0, column=1, sticky="w", padx=10, pady=4)
+        preset.bind("<<ComboboxSelected>>", lambda e: self.apply_fp_preset())
+        tk.Label(fp_frame, text="starting points - the box confidence is shown in the live preview, use it to tune", fg="gray").grid(row=0, column=2, sticky="w")
+
+        fp_rows = (("Persons: extra minimum confidence:", self.person_conf_var, 0, 0.95, 0.05, "shadows usually score lower than people; 0 = off"),
+                   ("Track confirmation (best confidence):", self.confirm_conf_var, 0, 0.95, 0.05, "keep an object only if it was seen clearly once; 0 = off"),
+                   ("Minimum track length (frames):", self.min_track_len_var, 0, 90, 1, "drop objects that flash up on fewer frames; 0 = off"),
+                   ("Persons: minimum height/width ratio:", self.person_ratio_var, 0, 3, 0.1, "flat, wide shapes are mostly shadows; 0 = off"))
+        for r, (label, var, lo, hi, inc, hint) in enumerate(fp_rows, start=1):
+            tk.Label(fp_frame, text=label).grid(row=r, column=0, sticky="w", pady=4)
+            tk.Spinbox(fp_frame, from_=lo, to=hi, increment=inc, textvariable=var, width=15).grid(row=r, column=1, sticky="w", padx=10, pady=4)
+            tk.Label(fp_frame, text=hint, fg="gray").grid(row=r, column=2, sticky="w")
+        tk.Label(fp_frame, justify="left", fg="gray", wraplength=620,
+                 text="Every stricter value also risks missing a real person. For privacy a blurred shadow is harmless, a missed person is not - "
+                      "so raise the values step by step and look at the result.").grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         pers_frame = tk.Frame(cfg_inner, pady=10)
         pers_frame.pack(fill="x")
@@ -2128,6 +2175,10 @@ class BlurApp:
             "tail_buffer": self.tail_buffer_var.get(),
             "join_gap": self.join_gap_var.get(),
             "thin_pct": self.thin_pct_var.get(),
+            "person_conf": self.person_conf_var.get(),
+            "confirm_conf": self.confirm_conf_var.get(),
+            "min_track_len": self.min_track_len_var.get(),
+            "person_ratio": self.person_ratio_var.get(),
             "media_dir": self.media_dir_var.get(),
             "existing": self.existing_var.get(),
             "preview_sec": self.preview_sec_var.get(),
@@ -2162,6 +2213,10 @@ class BlurApp:
         if "tail_buffer" in d: self.tail_buffer_var.set(d["tail_buffer"])
         if "join_gap" in d: self.join_gap_var.set(d["join_gap"])
         if "thin_pct" in d: self.thin_pct_var.set(d["thin_pct"])
+        if "person_conf" in d: self.person_conf_var.set(d["person_conf"])
+        if "confirm_conf" in d: self.confirm_conf_var.set(d["confirm_conf"])
+        if "min_track_len" in d: self.min_track_len_var.set(d["min_track_len"])
+        if "person_ratio" in d: self.person_ratio_var.set(d["person_ratio"])
         if "media_dir" in d: self.media_dir_var.set(d["media_dir"])
         if "existing" in d: self.existing_var.set(d["existing"])
         if "preview_sec" in d: self.preview_sec_var.set(str(d["preview_sec"]))
@@ -2374,6 +2429,15 @@ class BlurApp:
         except Exception:
             return default
 
+    def apply_fp_preset(self):
+        """Suggested starting values for the false-alarm filters (not tested on every kind of footage)."""
+        values = {"off": (0.0, 0.0, 0, 0.0), "moderate": (0.55, 0.65, 5, 0.0), "strong": (0.65, 0.75, 8, 0.9)}.get(self.fp_preset_var.get())
+        if values:
+            self.person_conf_var.set(values[0])
+            self.confirm_conf_var.set(values[1])
+            self.min_track_len_var.set(values[2])
+            self.person_ratio_var.set(values[3])
+
     def get_preview_frames(self, fps):
         """Preview interval in frames, from the 'seconds' field (decimals allowed, 0 = off)."""
         try:
@@ -2384,15 +2448,32 @@ class BlurApp:
             return 0
         return max(1, int(round(sec * fps)))
 
-    def collect_detections(self, results, frame_idx, width, height, key_prefix, track_history, unique_tracks):
-        """Turns one YOLO result into padded track boxes (size filters applied). Shared by all modes."""
+    def _setting(self, name, default, integer=False):
+        """A number from one of the settings variables (tolerant of missing variables and junk input)."""
+        var = getattr(self, name, None)
+        if var is None:
+            return default
+        return self._int_setting(var, default) if integer else self._float_setting(var, default)
+
+    def _read_filters(self):
+        """The false-alarm filter settings, read once at the start of a run."""
+        self._fcfg = {"person_conf": self._setting("person_conf_var", 0.0), "person_ratio": self._setting("person_ratio_var", 0.0),
+                      "confirm_conf": self._setting("confirm_conf_var", 0.0), "min_track_len": self._setting("min_track_len_var", 0, True)}
+        return self._fcfg
+
+    def collect_detections(self, results, frame_idx, width, height, key_prefix, track_history, unique_tracks, track_conf=None):
+        """Turns one YOLO result into padded track boxes (size and false-alarm filters applied). Shared by all modes.
+        track_conf (optional) collects [best confidence, detections] per track for the later confirmation step."""
         frame_detections = []
         if results.boxes is not None and results.boxes.id is not None:
             boxes = results.boxes.xyxy.cpu().numpy()
             ids = results.boxes.id.cpu().numpy().astype(int)
             classes = results.boxes.cls.cpu().numpy().astype(int)
+            raw_conf = getattr(results.boxes, "conf", None)
+            confs = raw_conf.cpu().numpy() if raw_conf is not None else [1.0] * len(boxes)
+            cfg = getattr(self, "_fcfg", None) or self._read_filters()
 
-            for box, tid, cls_id in zip(boxes, ids, classes):
+            for box, tid, cls_id, conf in zip(boxes, ids, classes, confs):
                 x1, y1, x2, y2 = map(int, box)
                 w_box = x2 - x1
                 h_box = y2 - y1
@@ -2402,6 +2483,11 @@ class BlurApp:
 
                 if h_box < min_h or (w_box * h_box) < min_area:
                     continue
+                if cls_id == 0:                      # a person (not a bike or motorbike): shadows are the usual false alarm
+                    if cfg["person_conf"] > 0 and conf < cfg["person_conf"]:
+                        continue
+                    if cfg["person_ratio"] > 0 and h_box < cfg["person_ratio"] * w_box:      # flat shape = probably a shadow
+                        continue
 
                 cls_name = "person" if cls_id == 0 else "vehicle"
                 key = f"{key_prefix}{cls_name}_{tid}"
@@ -2417,7 +2503,11 @@ class BlurApp:
                 coord = (x1, y1, x2 - x1, y2 - y1)
                 if key not in track_history: track_history[key] = []
                 track_history[key].append((frame_idx, *coord))
-                frame_detections.append(((x1, y1, x2, y2), f"{cls_name.capitalize()} #{tid}"))
+                if track_conf is not None:
+                    rec = track_conf.setdefault(key, [0.0, 0])
+                    rec[0] = max(rec[0], float(conf))
+                    rec[1] += 1
+                frame_detections.append(((x1, y1, x2, y2), f"{cls_name.capitalize()} #{tid}  {float(conf):.2f}"))
         return frame_detections
 
     def reset_tracker(self, model):
@@ -2445,6 +2535,7 @@ class BlurApp:
             imgsz = self.imgsz_var.get()
             tail_buffer = self.tail_buffer_var.get()
             join_gap = self._int_setting(self.join_gap_var, 20)
+            fcfg = self._read_filters()
 
             if mode == "persons":
                 target_classes = [0]
@@ -2489,6 +2580,7 @@ class BlurApp:
                 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hw_accel;vaapi"       # VAAPI exists on Linux only
 
             tracks_by_path = {}
+            conf_by_path = {}
             range_count = {}
             unique_tracks = set()
             done = 0
@@ -2509,6 +2601,7 @@ class BlurApp:
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 preview_interval = self.get_preview_frames(fps)
                 track_history = tracks_by_path.setdefault(path, {})
+                track_conf = conf_by_path.setdefault(path, {})
                 ri = range_count.get(path, 0)
                 range_count[path] = ri + 1
 
@@ -2523,7 +2616,7 @@ class BlurApp:
                     if not ret:
                         break
                     results = model.track(frame, persist=True, conf=conf, imgsz=imgsz, classes=target_classes, device=device_choice, verbose=False)[0]
-                    frame_detections = self.collect_detections(results, frame_idx, width, height, f"r{ri}_", track_history, unique_tracks)
+                    frame_detections = self.collect_detections(results, frame_idx, width, height, f"r{ri}_", track_history, unique_tracks, track_conf)
                     tl_now = proj.timeline_frame(path, frame_idx)
                     if tl_now is not None:
                         last_tl = tl_now
@@ -2551,10 +2644,12 @@ class BlurApp:
                 if cancelled:
                     break
 
-            joins = 0
-            for th in tracks_by_path.values():
-                joins += ka.consolidate_tracks(th, join_gap)       # first join fragments of one object ...
-                ka.extend_tails(th, tail_buffer)                   # ... then add the tail
+            joins = removed = 0
+            for path_, th in tracks_by_path.items():
+                tc = conf_by_path.get(path_, {})
+                joins += ka.consolidate_tracks(th, join_gap, conf=tc)            # first join fragments of one object ...
+                removed += ka.confirm_tracks(th, tc, fcfg["confirm_conf"], fcfg["min_track_len"])   # ... drop what was never seen clearly ...
+                ka.extend_tails(th, tail_buffer)                                  # ... then add the tail
 
             if cancelled and done == 0:
                 self.status_var.set("Status: Cancelled before anything was processed - nothing saved.")
@@ -2571,6 +2666,8 @@ class BlurApp:
                      f"Anonymized: {stats['processed']}  (pieces: {stats['pieces']}, filters: {stats['filters']})",
                      f"Left untouched (existing tracker effect): {stats['kept_existing']}",
                      f"No detections: {stats['no_detections']}"]
+            if removed:
+                lines.append(f"Tracks removed by the false-alarm filters (shadows etc.): {removed}")
             if stats.get("keyframes_dense"):
                 lines.append(f"Keyframes written: {stats['keyframes']} (instead of {stats['keyframes_dense']}); track fragments joined: {joins}")
             if window is not None:
@@ -2615,6 +2712,7 @@ class BlurApp:
             imgsz = self.imgsz_var.get()
             tail_buffer = self.tail_buffer_var.get()
             join_gap = self._int_setting(self.join_gap_var, 20)
+            fcfg = self._read_filters()
             blur_intensity = self.blur_strength_var.get()
 
             if mode == "persons":
@@ -2647,6 +2745,7 @@ class BlurApp:
                 frame_idx = 0
 
             track_history = {}
+            track_conf = {}
             unique_tracks = set()
             preview_interval = self.get_preview_frames(fps)
             start_time = time.time()
@@ -2666,7 +2765,7 @@ class BlurApp:
                     break
                 
                 results = model.track(frame, persist=True, conf=conf, imgsz=imgsz, classes=target_classes, device=device_choice, verbose=False)[0]
-                frame_detections = self.collect_detections(results, frame_idx, width, height, "", track_history, unique_tracks)
+                frame_detections = self.collect_detections(results, frame_idx, width, height, "", track_history, unique_tracks, track_conf)
 
                 frame_idx += 1
 
@@ -2702,7 +2801,8 @@ class BlurApp:
                 return
 
             # --- Join fragments of one object, then apply the tail buffer ---
-            ka.consolidate_tracks(track_history, join_gap)
+            ka.consolidate_tracks(track_history, join_gap, conf=track_conf)
+            ka.confirm_tracks(track_history, track_conf, fcfg["confirm_conf"], fcfg["min_track_len"])
             if tail_buffer > 0:
                 for track_key, coords in track_history.items():
                     if not coords:
