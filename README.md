@@ -1,6 +1,6 @@
 # Kdenlive Auto-Blur Tool
 
-<img src="autoblur-gui.png" width="96" align="right" alt="icon">
+<img src="kdenlive-blur-gui.png" width="96" align="right" alt="icon">
 
 Detects, tracks and blurs **people and vehicles** in your footage – and puts the result straight
 into your **Kdenlive project** as normal, editable tracking effects.
