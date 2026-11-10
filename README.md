@@ -31,8 +31,7 @@ follows them. Open the copy in Kdenlive, check it, fix what you want by hand, re
   (or redone, your choice), so your manual work is safe.
 * **Merge effects between projects.** Copy the blur effects (and the cuts they need) from an earlier project -
   for example a one-clip project - into a bigger edit that uses the same video files.
-* **Live preview** with boxes, track IDs, detection confidence, timeline position, progress and time remaining.
-* **False-alarm filters** against shadows and reflections: extra confidence for persons, track confirmation, minimum track length and a shape check.
+* **Live preview** with boxes, track IDs, timeline position, progress and time remaining.
 * **Check video mode.** Alternatively, render a quick `.mkv` with the blur burned in (with the
   original audio) straight from a video file – handy for testing the detection settings.
 * **Fast on Intel graphics** (OpenVINO), also runs on CPU and NVIDIA GPUs.
@@ -248,7 +247,6 @@ Windows *Apps & features*), then delete the two folders above if you want to get
 | Intel GPU not used / error on first run | Install the Intel compute runtime (see above) or set **Execution Device (Hardware)** to `cpu`. |
 | One person gets several separate effects / the blur flickers | Raise **Join Track Fragments** (max gap in frames) in the *Advanced Configuration* tab. Lower it if two different people get joined. |
 | Too many keyframes, or the blur lags on a sharp turn | **Keyframe Thinning**: a higher value gives fewer keyframes, a lower value (e.g. 2) follows fast turns more closely, `0` writes one keyframe per frame. |
-| Shadows (or reflections) are blurred as if they were people | Open the *Advanced Configuration* tab, section **False-Alarm Filters**, and start with the preset `moderate` (then `strong`). The live preview shows the confidence next to every box, so you can see what shadows score. Raise the values step by step: every stricter value also risks missing a real person. A larger model (e.g. `yolo11m.pt` or `yolo11x.pt` instead of the small one) and a larger *Image size* (960 or 1280) often separate shadows from people better, at the cost of speed. In the Kdenlive project every object is its own effect, so a stray shadow can also simply be deleted there. |
 | Blur sits slightly off at a cut | Increase **Tail Buffer Extension** or lower the **Confidence Threshold** in the *Advanced Configuration* tab; fine-tune by hand in Kdenlive. |
 
 ## Building the packages
