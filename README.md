@@ -267,9 +267,13 @@ Run these from a clone of the repository (the `LICENSE` file in the repository r
 # Windows  (install Inno Setup 6 from https://jrsoftware.org/isinfo.php)
 ISCC.exe packaging\windows\kdenlive-blur-gui.iss
 #   -> dist\kdenlive-blur-gui-setup-<version>.exe
+
+# Optional: build the same Windows installer from Linux (Debian / Ubuntu: sudo apt install nsis)
+sh packaging/windows/build-nsis.sh
+#   -> dist/kdenlive-blur-gui-setup-<version>.exe
 ```
 The version number is `__version__` in `kdenlive_blur_gui.py`; keep the `Version:` line of the spec file and
-`MyAppVersion` in the Inno Setup script in step with it.
+`MyAppVersion` in the Inno Setup script in step with it. The NSIS build script reads the app version automatically.
 
 ## License
 
