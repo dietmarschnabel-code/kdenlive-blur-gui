@@ -240,7 +240,7 @@ Windows *Apps & features*), then delete the two folders above if you want to get
 | "Python's Tk module is missing" | Debian/Ubuntu: `sudo apt install python3-tk` · Fedora: `sudo dnf install python3-tkinter` |
 | "Could not create the Python environment" | Debian/Ubuntu: `sudo apt install python3-venv` |
 | Download of components fails | Check the internet connection and start the tool again – it resumes. Details: `python3 kdenlive_blur_gui.py --install-deps` in a terminal. |
-| pip finds no PyTorch for your Python | Your Python is newer than PyTorch supports. Install an older one (e.g. `sudo dnf install python3.12`) and run `python3.12 kdenlive_blur_gui.py --install-deps`. |
+| "No matching distribution found" / the components do not install (very new Python, e.g. on a freshly released Fedora) | The tool now tries every other installed Python (3.10 - 3.13) automatically and rebuilds a broken private environment. If none is installed: `sudo dnf install python3.12 python3.12-tkinter` (Fedora) or the equivalent for your system, then run `python3 kdenlive_blur_gui.py --install-deps`. |
 | `libGL.so.1` / `libglib` error | `sudo apt install libgl1 libglib2.0-0` (Fedora: `sudo dnf install mesa-libGL`) |
 | "ffmpeg was not found" (check video) | Debian: `sudo apt install ffmpeg` · Fedora: `sudo dnf install ffmpeg-free` · Windows: `winget install Gyan.FFmpeg` |
 | "Download failure" for a YOLO model | The model is downloaded from GitHub on first use. Check internet/firewall, or download the `.pt` file from <https://github.com/ultralytics/assets/releases> and put it into the `models` folder above. |
@@ -267,13 +267,9 @@ Run these from a clone of the repository (the `LICENSE` file in the repository r
 # Windows  (install Inno Setup 6 from https://jrsoftware.org/isinfo.php)
 ISCC.exe packaging\windows\kdenlive-blur-gui.iss
 #   -> dist\kdenlive-blur-gui-setup-<version>.exe
-
-# Optional: build the same Windows installer from Linux (Debian / Ubuntu: sudo apt install nsis)
-sh packaging/windows/build-nsis.sh
-#   -> dist/kdenlive-blur-gui-setup-<version>.exe
 ```
 The version number is `__version__` in `kdenlive_blur_gui.py`; keep the `Version:` line of the spec file and
-`MyAppVersion` in the Inno Setup script in step with it. The NSIS build script reads the app version automatically.
+`MyAppVersion` in the Inno Setup script in step with it.
 
 ## License
 
@@ -287,6 +283,9 @@ It uses these components, which are installed separately and keep their own lice
 The tool writes projects for [Kdenlive](https://kdenlive.org) (GPL); it is an independent project and not
 affiliated with or endorsed by the Kdenlive team or KDE.
 
+The tool writes projects for [Kdenlive](https://kdenlive.org) (GPL); it is an independent project and not
+affiliated with or endorsed by the Kdenlive team or KDE.
+
 ## Development note
 
 Parts of this program were written with the help of AI assistants and tested by the author on real footage.
@@ -294,5 +293,5 @@ Bug reports and pull requests are welcome.
 
 ## Author and contact
 
-Copyright (C) 2026 **Dietmar Schnabel** - e-mail: `dietmar.schnabel<at>gmail.com` (write it with @ instead of `<at>`).
+Copyright (c) 2026 **Dietmar Schnabel** - e-mail: `dietmar.schnabel<at>gmail.com` (write it with @ instead of `<at>`).
 Bug reports and ideas are welcome as GitHub issues.

@@ -18,7 +18,7 @@ Run:            python3 kdenlive_blur_gui.py
 Dry run:        python3 kdenlive_blur_gui.py project.kdenlive [media_folder] [start] [end]
 Repair/install: python3 kdenlive_blur_gui.py --install-deps
 """
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 APP_NAME = "Kdenlive Auto-Blur Tool"
 
 import os
@@ -116,6 +116,9 @@ def system_package_hint(what):
         ("tk", "windows"): "run the Python installer from python.org again (Modify) and tick 'tcl/tk and IDLE'",
         ("venv", "debian"): "sudo apt install python3-venv",
         ("venv", "fedora"): "sudo dnf install python3",
+        ("python", "debian"): "sudo apt install python3.12 python3.12-venv python3.12-tk   (older versions may need an extra repository)",
+        ("python", "fedora"): "sudo dnf install python3.12 python3.12-tkinter",
+        ("python", "windows"): "install Python 3.12 from https://www.python.org/downloads/ (keep 'tcl/tk and IDLE' ticked)",
         ("ffmpeg", "debian"): "sudo apt install ffmpeg",
         ("ffmpeg", "fedora"): "sudo dnf install ffmpeg-free   (or 'ffmpeg' from RPM Fusion)",
         ("ffmpeg", "windows"): "winget install Gyan.FFmpeg   (or download it from https://ffmpeg.org and add it to PATH)",
@@ -161,38 +164,120 @@ class _InstallError(Exception):
     pass
 
 
-def _run_logged(cmd, log):
+# pip messages that mean "there are no packages for this Python version" (a brand-new Python is often not supported yet)
+_INCOMPATIBLE = ("No matching distribution found", "Could not find a version that satisfies the requirement",
+                 "requires a different Python")
+
+
+def _run_logged(cmd, log, tail=None):
     log("$ " + " ".join(cmd))
     env = dict(os.environ, PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONUNBUFFERED="1")
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          errors="replace", env=env, creationflags=_NO_WINDOW)
     for line in p.stdout:
         log(line.rstrip())
+        if tail is not None:
+            tail.append(line)
+            del tail[:-80]                       # keep the last lines to recognise the reason of a failure
     return p.wait()
 
 
-def install_dependencies(variant, log):
-    """variant 'cpu': CPU build of PyTorch (small, also used for Intel GPUs through OpenVINO).
-    variant 'default': whatever PyPI offers (on Linux a large CUDA build for NVIDIA cards)."""
-    os.makedirs(_data_dir(), exist_ok=True)
-    if os.path.exists(_OK_MARKER):
-        os.remove(_OK_MARKER)
-    if not os.path.exists(_venv_python()):
-        log("Creating a private Python environment in " + VENV_DIR)
-        if _run_logged([sys.executable, "-m", "venv", VENV_DIR], log) != 0:
-            raise _InstallError("Could not create the Python environment.\nTry:  " + system_package_hint("venv"))
+def _find_pythons(log):
+    """Interpreters that can build the private environment: the running one first, then other installed versions.
+    The newest Python often has no PyTorch packages yet, so an older one is the fallback."""
+    cur = "%d.%d" % sys.version_info[:2]
+    found = [(sys.executable, cur)]
+    for minor in (12, 11, 13, 10, 14):
+        ver = "3.%d" % minor
+        if ver == cur:
+            continue
+        exe = None
+        if os.name == "nt":
+            try:
+                r = subprocess.run(["py", "-" + ver, "-c", "import sys; print(sys.executable)"], capture_output=True, text=True,
+                                   timeout=15, creationflags=_NO_WINDOW)
+                exe = r.stdout.strip() if r.returncode == 0 else None
+            except (OSError, subprocess.SubprocessError):
+                exe = None
+        else:
+            exe = shutil.which("python" + ver)
+        if exe:
+            found.append((exe, ver))
+    usable = []
+    for exe, ver in found:
+        if exe == sys.executable:
+            usable.append((exe, ver))
+            continue
+        try:                                     # the window needs Tk, the environment needs venv
+            ok = subprocess.run([exe, "-c", "import tkinter, venv, ensurepip"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=30, creationflags=_NO_WINDOW).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            ok = False
+        if ok:
+            usable.append((exe, ver))
+        else:
+            log("Python %s is installed but lacks Tk or the venv module - skipped (%s)." % (ver, system_package_hint("tk")))
+    return usable
+
+
+def _venv_runs():
+    try:
+        return subprocess.call([_venv_python(), "-c", "pass"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, creationflags=_NO_WINDOW) == 0
+    except OSError:
+        return False
+
+
+def _pip_steps(variant, log, tail):
     py = _venv_python()
     steps = [[py, "-m", "pip", "install", "--upgrade", "pip"]]
     if variant == "cpu":
         steps.append([py, "-m", "pip", "install", "torch", "torchvision", "--index-url", "https://download.pytorch.org/whl/cpu"])
     steps.append([py, "-m", "pip", "install", "ultralytics", "opencv-python", "pillow", "openvino"])
     for cmd in steps:
-        if _run_logged(cmd, log) != 0:
+        rc = _run_logged(cmd, log, tail)
+        if rc != 0:
+            return rc
+    return 0
+
+
+def install_dependencies(variant, log):
+    """variant 'cpu': CPU build of PyTorch (small, also used for Intel GPUs through OpenVINO).
+    variant 'default': whatever PyPI offers (on Linux a large CUDA build for NVIDIA cards).
+    If the packages do not exist for the running Python (very new versions), other installed Python versions are tried;
+    a broken environment (e.g. its Python was removed by a system upgrade) is rebuilt."""
+    os.makedirs(_data_dir(), exist_ok=True)
+    if os.path.exists(_OK_MARKER):
+        os.remove(_OK_MARKER)
+    pythons = _find_pythons(log)
+    if os.path.exists(_venv_python()) and not _venv_runs():
+        log("The private environment is broken (its Python is gone, e.g. after a system upgrade) - rebuilding it.")
+        shutil.rmtree(VENV_DIR, ignore_errors=True)
+    tried = []
+    for n, (exe, ver) in enumerate(pythons):
+        if n > 0 or not os.path.exists(_venv_python()):          # the first try may use an existing, working environment
+            if os.path.exists(VENV_DIR):
+                shutil.rmtree(VENV_DIR, ignore_errors=True)
+            log("Creating a private Python environment with Python %s in %s" % (ver, VENV_DIR))
+            if _run_logged([exe, "-m", "venv", VENV_DIR], log) != 0:
+                tried.append(ver)
+                log("Could not create an environment with Python %s (%s)." % (ver, system_package_hint("venv")))
+                continue
+        tail = []
+        if _pip_steps(variant, log, tail) == 0:
+            with open(_OK_MARKER, "w", encoding="utf-8") as f:
+                f.write(__version__)
+            log("All components installed.")
+            return
+        tried.append(ver)
+        if not any(text in line for line in tail for text in _INCOMPATIBLE):
             raise _InstallError("A download or installation step failed (see the log above).\n"
                                 "Check your internet connection, then start the tool again to retry.")
-    with open(_OK_MARKER, "w", encoding="utf-8") as f:
-        f.write(__version__)
-    log("All components installed.")
+        log("Python %s has no matching packages (probably too new) - trying another installed Python ..." % ver)
+    raise _InstallError("The components could not be installed with any available Python (tried: %s).\n"
+                        "PyTorch usually supports Python 3.10 to 3.13; a brand-new Python has to wait for it.\n"
+                        "Install an older Python with Tk, for example:\n  %s\nand run it again:  %s kdenlive_blur_gui.py --install-deps"
+                        % (", ".join(tried) or "none", system_package_hint("python"), "py" if os.name == "nt" else "python3"))
 
 
 def _gui_possible():
@@ -325,7 +410,7 @@ def _bootstrap_after_import_error(err):
         if "libGL" in reason or "libglib" in reason:
             hint = "\n\nA system library is missing. On Debian/Ubuntu:  sudo apt install libgl1 libglib2.0-0"
         _fatal(APP_NAME, "A component of the private Python environment cannot be loaded:\n\n%s%s\n\n"
-                         "To repair it run in a terminal:\n  %s kdenlive_blur_gui.py --install-deps" % (reason, hint, "py" if os.name == "nt" else "python3"))
+                         "To repair or rebuild it (also after a Python upgrade) run in a terminal:\n  %s kdenlive_blur_gui.py --install-deps" % (reason, hint, "py" if os.name == "nt" else "python3"))
     if os.path.exists(_venv_python()):
         if os.path.exists(_OK_MARKER):
             _relaunch_in_venv()                    # known to be complete: no slow check, no flashing console window
@@ -1761,6 +1846,7 @@ class BlurApp:
 
         tk.Label(inf_frame, text="YOLO Model Version:").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Combobox(inf_frame, textvariable=self.model_var, values=["yolo26s.pt", "yolo26n.pt", "yolo26m.pt", "yolo26x.pt", "yolo11s.pt", "yolo11n.pt", "yolo11m.pt", "yolo11x.pt"], state="readonly", width=18).grid(row=0, column=1, sticky="w", padx=10, pady=4)
+        tk.Label(inf_frame, text="n = fastest, s, m, x = most accurate but slower; a model is downloaded on first use", fg="gray").grid(row=0, column=2, sticky="w")
 
         tk.Label(inf_frame, text="Execution Device (Hardware):").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Combobox(inf_frame, textvariable=self.device_var, values=["intel:gpu", "intel:cpu", "intel:npu", "cuda:0", "cpu"], state="readonly", width=18).grid(row=1, column=1, sticky="w", padx=10, pady=4)
